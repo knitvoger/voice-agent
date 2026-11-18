@@ -279,11 +279,9 @@ backend and does not require the Projects SDK; follow its README for setup.
 The common Python SDK samples require `azure-ai-projects>=2.11.0` from PyPI.
 
 The GPT Live samples in `gpt_live/` share one `.env`. The Python terminal samples in
-`gpt_live/python/` use their own `samples/gpt_live/python/.venv` with pinned packages and a
-bundled preview `azure-ai-projects` 2.11.0 wheel from `dist/` for the GPT Live agent models
-and Live WebSocket client; that preview changes APIs other samples use, so keep it out of the
-shared `.venv`. The browser sample in `gpt_live/js/` uses Node.js 22+ and
-the bundled preview `@azure/ai-projects` package from `dist/` instead. Follow their READMEs
+`gpt_live/python/` use their own `samples/gpt_live/python/.venv` with pinned packages and
+`azure-ai-projects[voice]>=2.11.0` from PyPI. The browser sample in `gpt_live/js/` uses
+Node.js 22+ and `@azure/ai-projects` 2.11.0 from npm. Follow their READMEs
 for configuration and installation.
 
 The SIP sample in `sip_voice_agent/` is standalone and uses its own
