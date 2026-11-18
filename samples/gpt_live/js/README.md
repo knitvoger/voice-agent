@@ -211,9 +211,9 @@ Responses delegation.`), so `sendToolOutput` and `sendResponseItem` cannot be us
 session. The service accepts these commands in managed mode, and the Python SDK sends them.
 So `openLiveSession` keeps a handle on its transport and sends the two commands on it directly.
 Everything else, including the handshake, the token request, and event parsing, goes through
-the SDK. [Azure/azure-sdk-for-js#40705](https://github.com/Azure/azure-sdk-for-js/pull/40705)
-removes the restriction for Foundry-managed sessions; once an npm release includes it, the
-page can use the SDK's own methods.
+the SDK. A proposed SDK change to allow these commands in Foundry-managed sessions,
+[Azure/azure-sdk-for-js#40705](https://github.com/Azure/azure-sdk-for-js/pull/40705), was closed
+without merging, so the sample keeps this workaround.
 
 `browser_bundle.mjs` bundles the page with esbuild from the SDK package's browser build. The
 package's entry point also re-exports `AIProjectClient`, which imports the OpenAI SDK for its
