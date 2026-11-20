@@ -1,10 +1,9 @@
 # Test procedure
 
 Commands below run from `samples/hub-domain-agent` with its `.venv` active.
-Offline tests do not need Azure credentials. **Deployment, TTS, text smoke and
-voice tests make real calls and incur charges**; run only in your authorized
-project. No test creates infrastructure, grants roles, changes pools, or changes
-shared service configuration.
+Offline tests do not need Azure credentials. **Deployment and text smoke make
+real calls and incur charges**; run only in your authorized project. No test creates
+infrastructure, grants roles, changes pools, or changes shared service configuration.
 
 ## 1. Offline application and SDK checks
 
@@ -18,9 +17,18 @@ These exercise the real routing, streaming, snapshot hooks, SDK lifecycle
 routes, OpenAI 3.55 stream parser, version serialization, cancellation and scoped
 cleanup. Model/identity/Domain network boundaries are substituted. They do not
 prove Azure IAM, container pull access, platform snapshot capture, or Voice Live.
-Client-orchestration regressions also substitute the WebSocket provider and local
-credentials: they prove ownership checkpointing, early-audio rejection, exact-ID
-validation, shutdown checks and cancellation-safe cleanup, not deployed permissions.
+Text smoke regressions substitute HTTP and credentials: they prove parent
+readiness checks, version guards, ownership checkpointing and cleanup/error
+handling, not deployed permissions.
+
+The focused regressions cover interrupted writes at all seven deployment
+checkpoints, fsync/replace failure and retry; lost/cancelled CREATEs followed by
+repeated 404s, late visibility, version guards and failed/retried deletion; and
+matching/mismatched tool names with cold and cached Domain sessions. They assert
+that unresolved acquisition retries do not submit another CREATE, unrelated
+resources are untouched, and invalid routing never commits customer history.
+Explicit 400/401/403/404/429 rejection is paired with corrected later requests;
+408/5xx, lost responses and cancellation retain unresolved ownership instead.
 
 Optional local container health check (no Azure credentials or model calls):
 
@@ -65,12 +73,22 @@ runs inside the exact Hub session under its own Hosted identity, then the client
 deletes the parent. The client never assumes a CLI 404 means a child was deleted.
 If that Hub cannot be reached, retain the report and request explicit operator
 recovery with verified cross-user session permissions as described in README.
+After CREATE, the client checks the pinned parent version and waits for active/idle
+under a separate 90-second readiness deadline. It polls only that exact ID every
+one second; failed/version-mismatched sessions never receive business input.
+Failure/cancellation preserves the ownership record and still attempts cleanup;
+cleanup/report errors cannot replace an already recorded primary failure.
+If CREATE timed out or was cancelled and cleanup only observed 404, require
+`cleanup_complete=false` and retain `create_unresolved=true`. Do not rerun the
+business smoke to replace that failure. Reconcile the original exact ID through
+authorized operator cleanup; once the matching resource is visible, delete it
+without submitting another CREATE. A wrong version must never be deleted.
 
 Inspect result `turns[*].status`:
 
 - `captured=true`, nonempty `restore_id`; the same restore/session ID across
   T1/T2 of the same customer.
-- First completed turn has `history_messages=2`, then4; a new customer starts
+- First completed turn has `history_messages=2`, then 4; a new customer starts
   from empty history, not another customer's history.
 - Hub `last_route=billing`; one Billing session reused, no Booking session.
 - Answers explain the synthetic increase: 15 excess calls × 2 yuan = 30 yuan,
@@ -81,7 +99,7 @@ Inspect result `turns[*].status`:
 In Foundry container log streams, correlate `SNAPSHOT_BEFORE`, `SNAPSHOT_AFTER`,
 `INVOKE`, `HUB_ROUTE`, `DOMAIN_READY` and `DOMAIN_RESPONSE`. Check distinct restore
 IDs between independent customers, the same capture boot ID per version, and
-Domain restore IDs/history0→2 across the two invocations. `status` reports history
+Domain restore IDs/history 0→2 across the two invocations. `status` reports history
 *after* completion; invocation/response headers report it *before* that turn.
 No customer text, token, or credentials are written to server application logs.
 
@@ -102,134 +120,55 @@ python smoke.py --role hub \
   --output results/hub-booking-smoke.json
 ```
 
-Expected:Hello→`self` with no Domain session; booking→`booking` with one reused
+Expected: Hello→`self` with no Domain session; booking→`booking` with one reused
 Booking session. Inspect actual route/status, not just plausible spoken text.
 Cross-topic switches must re-evaluate the tools; follow-ups may use prior history.
 
-## 4. Prepare identical English audio inputs
+## 4. Connect a separate Voice Live client
 
-Supply your own24kHz, mono,16-bit PCM WAVs, or generate the sample's five inputs:
+The sample does not include an audio generator, voice client, load driver, or
+internal telemetry exporter. Use a Voice Live client that supports direct Hosted
+Agent integration in your target environment, not a managed Voice Agent client
+that expects an Agent of kind `voice`.
 
-```bash
-python generate_audio.py --speech-endpoint https://<speech-account>.cognitiveservices.azure.com --output audio
-```
+Select the returned Hosted Hub using these connection query parameters:
 
-This optional step calls Azure TTS five times. Keep `audio/manifest.json` and
-SHA256s. Do not regenerate audio between comparison arms. The scripts do not
-upload test recordings to source control; `audio/` and `results/` are ignored.
+| Parameter | Value |
+| --- | --- |
+| `agent-name` | `deployment.json` → `agents.hub.name` |
+| `agent-version` | `deployment.json` → `agents.hub.version` |
+| `agent-project-name` | Project name from `project_endpoint` |
 
-## 5. One-customer Voice Live audio smoke
+Use your resource's Voice Live endpoint, supported API version and authentication.
+The client owns microphone/audio format, speech recognition/synthesis, input
+turns, interruption, transport and session lifecycle. Configure those through
+that client's supported interface; none of them is a Hub/Domain environment
+variable. This sample neither grants Voice Live access nor changes its pools.
 
-Confirm the direct Voice Live/Hosted integration and the preview API version
-are enabled in your target. `VOICE_LIVE_ENDPOINT` is the resource's secure
-WebSocket URL, not the Project URL or a managed Voice Agent connection URL.
+The deployed Hub still answers greetings itself and routes Billing/Booking
+requests to the pinned Domains. The text checks above verify those agent paths;
+they do not establish end-to-end voice behavior or TTFA.
 
-```bash
-python voice_test.py --role hub --turn1 audio/billing-1.wav --turn2 audio/billing-2.wav \
-  --customers 1 --output results/voice-smoke
-```
+## 5. Cleanup and readiness handoff
 
-The driver selects the pinned Hosted Hub via `agent-name`, `agent-version` and
-`agent-project-name`; sets English speech recognition/Jenny output; paces PCM;
-and starts T2 immediately after T1's first nonempty audio. It keeps a concurrent
-receiver running for cancellation/control events. There is no `response.done`
-plus fixed-delay wait before T2 and no automatic greeting/setup business turn.
-Expected T1 interruption/cancelled is not itself failure; T2 must complete.
-The original frames must all be sent before a response starts; an internal WAV
-pause that triggers an early response fails the sample rather than silently
-dropping remaining speech. Only trailing silence may be cancelled to start T2.
-Voice Live and Hosted IDs are atomically checkpointed before WAV input.
-
-Require audio and distinct response/input IDs for both turns, successful scoped
-cleanup, and inspect any transport/model errors. A close-code1006 after output
-must be retained as a lifecycle issue, not described as an error-free run.
-`success=true` is assigned only after valid turn IDs, normal shutdown (1000/1001),
-and successful owned cleanup. Session cleanup is outside the 300-second customer
-deadline; socket teardown is still inside it (a separately tracked review finding).
-Socket teardown and session cleanup each have a separate 120-second bound and
-are shielded/drained before cancellation propagates. A cleanup timeout/failure
-stops the serial cohort, retains the failed customer, and blocks native export.
-Close failure or shutdown expiry cancels and drains the receiver before returning,
-so it cannot indefinitely prevent the parent-session cleanup attempt. See
-[cleanup regression evidence](FIX_VALIDATION.md) for the supported paths and limits.
-The platform may merge interrupted T1 ASR with T2 input; Hub forwards the input
-it actually receives unchanged. Do not assume the T2 invocation equals only
-the second WAV transcript under immediate interruption.
-
-## 6. Optional20-customer serial comparison
-
-Run only after smoke passes and you explicitly want a billed benchmark:
-
-```bash
-# Hub answers directly: greeting, no Domain invocation.
-python voice_test.py --role hub --turn1 audio/hello.wav --turn2 audio/hello.wav \
-  --customers 20 --output results/hub-self-20
-
-# Direct Billing: no routing Hub.
-python voice_test.py --role billing --turn1 audio/billing-1.wav --turn2 audio/billing-2.wav \
-  --customers 20 --output results/billing-direct-20
-
-# Hub routes to Billing; both snapshot-enabled, Domain reused at T2.
-python voice_test.py --role hub --turn1 audio/billing-1.wav --turn2 audio/billing-2.wav \
-  --customers 20 --output results/hub-billing-20
-```
-
-Within each command, new customers run **strictly serially**, not concurrently.
-Keep the same versions/model/audio/voice and warmup policy. The Hello arm answers
-a different question:it is not a matched causal A/B control for Billing. Direct
-Billing versus Hub→Billing does use the same WAV pair, but sequential cohorts
-still do not control model destination/load; EU Data Zone can route to different
-regions inside its zone.
-
-Domain session acquisition lies inside Hub T1, while initial Hosted acquisition
-in direct/Hub-only paths precedes audio. T2 reuses sessions but still pays for
-the additional Hub routing LLM and Hosted HTTP hop. Never add/subtract unrelated
-percentiles as an exact stage budget.
-
-### Native TTFA P50/P90
-
-`result.json` includes session/response/input-item IDs and client diagnostic
-timings. **Client speech-stopped-event receipt→first audio receipt is not native
-Voice Live TTFA** and must not be relabeled as such. Initial acquisition is not
-included in either turn metric and should be reported separately.
-
-For an authorized Voice Live service telemetry operator:
-
-```bash
-python export_native_query.py results/hub-billing-20/result.json \
-  --output results/hub-billing-20/native-ttfa.kql
-```
-
-Run the exported query in the correct target's native telemetry database. Adapt
-table/time-column names if that deployment's schema differs. The sample neither
-grants telemetry access nor queries an internal cluster. Without native access,
-report only the labeled client observations; do not claim native percentiles.
-
-Before publishing native results, require **20 valid samples per turn**,
-`valid_samples=expected_samples`, zero missing/duplicate/invalid rows, and exact
-input-item matching. Native ingestion can lag; bounded re-querying of the **same
-IDs** is valid, resending business requests or replacing slow/missing samples is
-not. Preserve incomplete samples and disclose reduced sample counts if a bound
-expires; a smaller-cohort percentile is not a complete20-customer result.
-
-Report format:
-
-| Path | Turn | Native samples | Native TTFA P50(ms) | P90(ms) |
-| --- | --- | ---: | ---: | ---: |
-| Voice Live→Hub | T1/T2 separately | actual | measured | measured |
-| Voice Live→Billing | T1/T2 separately | actual | measured | measured |
-| Voice Live→Hub→Billing | T1/T2 separately | actual | measured | measured |
-
-Also report deployment/version/image, timestamp, audio hashes, effective pools,
-snapshot proof, Domain model warmup, actual routing when available, errors,
-cleanup outcome, and whether acquisition is outside/inside the reported metric.
-
-## 7. Cleanup and readiness handoff
-
-Both runners delete their exact owned sessions. Verify cleanup flags and retain
-deployment manifests. Agents/images remain for reuse. After verifying ownership
-and no other users, remove only the created sample agents via your organization's
+The text runner deletes only its exact owned sessions. Verify
+`cleanup_complete=true` and retain the deployment manifest and result, including
+on failure. Agents/images remain for reuse. After verifying ownership and no
+other users, remove only the created sample agents via your organization's
 normal lifecycle process; restore separately authorized pool changes first.
+
+If the process is killed, use the result's recorded parent ID and pinned
+deployment manifest to repeat the Hub cleanup action before deleting the parent.
+If the Hub is unavailable, retain the IDs and request operator recovery as
+described in README. A CLI 404 does not establish that the Hub's children are
+gone. Never delete sessions by prefix.
+
+A local ownership record is required when retrying the text client's cleanup
+helper (`ownership=report`); it must match the role and exact session ID. Missing
+outcome evidence is treated conservatively. Hub outcome flags do not survive
+process loss: consult the README's operator-reconciliation limitation before
+declaring cleanup complete after a crash. Repeated absence alone is not proof
+that an outstanding remote CREATE has terminated.
 
 Validation layers must stay distinct:
 
@@ -238,8 +177,8 @@ Validation layers must stay distinct:
 | Offline tests | Application behavior and SDK wire/serialization boundaries with external I/O replaced. |
 | Local container readiness | Packaging/startup/health only. |
 | Capture ACTIVE | Platform accepted and initialized that version's snapshot. |
-| Real text/audio smoke | Target identity, model, route, protocol and restore functionality for those requests. |
-| Authorized native metric audit | Exact measured TTFA for the retained requests, not a universal latency guarantee. |
+| Real text smoke | Target identity, model, route, protocol and restore functionality for those requests. |
+| Separate Voice Live client check | End-to-end voice behavior only when actually run against the intended deployment. |
 
-This change provides the procedures and local tests; it does not assert a new
-cloud deployment or benchmark has been run for these source-built images.
+This sample provides the procedures and local tests; it does not assert a new
+cloud deployment, live voice validation, or latency benchmark for these images.

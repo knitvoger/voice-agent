@@ -17,6 +17,7 @@ from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 
 from common.config import project_endpoint
+from common.records import write_report
 
 
 def definition(
@@ -96,7 +97,7 @@ def create(
         "agents": {},
     }
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, indent=2) + "\n")
+    write_report(output, result)
     for role, name in names.items():
         body = definition(endpoint, images[role], model, role, result["agents"], idle=idle, warmup=warmup)
         resource = client.agents.create_version(
@@ -112,13 +113,13 @@ def create(
             },
         )
         result["agents"][role] = {"name": name, "version": resource.version}
-        output.write_text(json.dumps(result, indent=2) + "\n")
+        write_report(output, result)
         live = wait_active(client, name, resource.version)
         observed = live.definition.as_dict()
         if any(observed.get(key) != value for key, value in body.as_dict().items()):
             raise RuntimeError("Created definition differs from requested snapshot/image/configuration")
         result["agents"][role]["instance_identity"] = live.as_dict().get("instance_identity")
-        output.write_text(json.dumps(result, indent=2) + "\n")
+        write_report(output, result)
     return result
 
 

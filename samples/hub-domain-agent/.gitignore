@@ -4,4 +4,3 @@
 .ruff_cache/
 deployment*.json
 results/
-audio/

@@ -22,7 +22,11 @@ points, and Docker images**. All use HTTP Invocations `2.0.0`. Each
 customer gets an exclusive Hub session. Domain sessions are created lazily,
 version-pinned, and reused for that customer's later turns. Billing and Booking
 are read-only simulations: no customer data, transactions, or external business
-system. All instructions and generated test speech are English.
+system. All agent instructions and example questions are English.
+
+This sample contains the agents, their deployment script, and focused text/offline
+tests. Audio recording/generation, voice clients, load tests, and service-internal
+telemetry tooling are outside its scope.
 
 ## Separate implementations
 
@@ -46,11 +50,16 @@ Each image copies only `common/` and its own business package.
   while continuing to read the model stream. It **does not send customer input**
   until the entire stream completes and exactly one registered empty-argument
   call has been validated. Invalid, mixed, truncated, or failed outputs fail.
+  The announced and final tool names must match, even for an already-ready Domain.
 - Domain output streams directly; there is no final Hub summarization LLM call.
   T2 reuses the Domain session but **still runs the Hub routing LLM**.
 - Cancellation drains speculative tasks, closes streams, and does not commit an
   incomplete turn. An indeterminate CREATE remains in the exact owned-ID map
-  for cleanup. A speculative but unused session can incur allocation cost.
+  for cleanup; a 404 does not resolve that CREATE or release its ID. Acquisition
+  retries reconcile that same ID with GET instead of submitting another CREATE.
+  Explicit CREATE rejections (400/401/403/404/429) do not leave a pending request;
+  a later user request can try again after the underlying problem is corrected.
+  A speculative but unused session can incur allocation cost.
 - Completed turns are stored in a bounded **process-local** history. This is
   not durable conversation storage or a guarantee of context retention after
   sandbox reclamation/restart. Production persistence needs a separate design.
@@ -81,10 +90,11 @@ sample uses OpenAI **3.55.0**, with no private parser/schema-cache monkeypatch.
    Ask the project administrator to grant the appropriate project-scoped roles.
    `deployment.json` records the returned identities. Treat authorization as a
    rollout dependency; an ACTIVE snapshot is not a successful business smoke.
-6. Voice tests need Voice Live access on the selected resource and the chosen
-   speech/voice capabilities. Optional WAV generation also needs Azure Speech
-   TTS access. Calls, allocated sandboxes, and optional warmup/TTS incur charges;
-   snapshot-specific billing must be confirmed with the platform owner.
+6. To connect a separate voice client, you also need Voice Live access on the
+   selected resource and the chosen speech/voice capabilities. Agent deployment,
+   sessions, model calls, optional model warmup, and Voice Live usage incur charges;
+   snapshot-specific billing must be confirmed with the platform owner. No
+   separate Speech TTS resource is required by this sample.
 
 The serving SDK owns health and snapshot lifecycle endpoints. Before capture,
 the application cancels/drains its optional warmup and closes HTTP/model/project/
@@ -107,8 +117,8 @@ az login
 PowerShell: use `py -3.13 -m venv .venv`, `.venv\Scripts\Activate.ps1`, and
 `Copy-Item .env.example .env`. Keep this environment separate from other samples.
 
-Set `.env` to your project, model deployment, three immutable image references, and
-Voice Live endpoint. Never put tokens, keys, or tenant-specific credentials in
+Set `.env` to your project, model deployment, and three immutable image references.
+Never put tokens, keys, or tenant-specific credentials in
 source. The container receives only explicit application configuration, not
 your local `.env`, CLI profile, or result files.
 
@@ -144,7 +154,9 @@ This creates uniquely named Billing, Booking, then Hub agents, waits for each
 version's snapshot capture to become ACTIVE, reads back its own image/definition, and
 pins the returned Domain versions in the Hub environment. Old Agents/versions
 are never updated or deleted. If creation fails partway, keep the deployment
-record: it contains planned names and accepted versions. There are no automatic
+record: each checkpoint atomically replaces the previous valid JSON. If writing
+an update fails, deployment stops and the last record still contains the planned
+names and any previously saved versions. There are no automatic
 business/deployment retries or silent snapshot-disable fallback.
 
 The three images can also be supplied explicitly with `--hub-image`,
@@ -189,10 +201,9 @@ customer history and is independent of readiness. Set `DOMAIN_MODEL_WARMUP=false
 ## Validate and test
 
 Follow **[TESTING.md](TESTING.md)** in order: offline tests, optional local health
-check, authorized deployed text smoke, routing checks, then optional audio
-smoke/serial TTFA comparison. The included scripts do not start a benchmark when
-you deploy or import them. Do not equate local hook tests with real platform
-capture/restore or IAM validation.
+check, authorized deployed text smoke, then routing checks. The guide also
+describes how a separate Voice Live client selects the Hosted Hub. Do not equate
+local hook tests with real platform capture/restore or IAM validation.
 
 Files:
 
@@ -204,20 +215,14 @@ Files:
 | `common/` | Shared infrastructure/lifecycle only; no specialist behavior or prompt registry. |
 | `deploy.py` | Typed snapshot-enabled definitions, unique versions, and readback manifest. |
 | `smoke.py` | Two text turns against a pinned role, lifecycle status, exact-ID cleanup. |
-| `generate_audio.py` | Optional real Azure TTS generation of Hello/Billing/Booking WAVs. |
-| `voice_test.py` | Paced WAV input, audio/ID recording, immediate T2, scoped cleanup. |
-| `export_native_query.py` | Exact-ID KQL for an authorized native-telemetry operator; no automatic query. |
 | `tests/` | Offline tests of real application/SDK boundaries with external services substituted. |
 
 ## Pools and cleanup
 
 **Memory snapshots and standby pools are different features.** Standby keeps
 allocated sandboxes ready; snapshots provide an initialized process image.
-This sample enables snapshots but **does not configure platform standby**.
-The optional voice driver requests Voice Live warm/shared/service-model pools
-off using preview feature controls; confirm effective service flags with the
-operator if collecting a baseline. If the service rejects preview controls,
-stop and use an explicitly supported configuration; do not silently drop them.
+This sample enables snapshots but **does not configure platform standby** or
+change Voice Live pool settings.
 
 If separately authorized, configure platform standby on each Hosted Agent's
 endpoint (`agent_endpoint.standby_pool.size`), wait for readiness, verify actual
@@ -226,9 +231,9 @@ environment enrollment blocker, not permission to change RBAC/service flags or
 fall back to another region. No standby benchmark or free-warm-pool claim is
 implied here.
 
-Both clients attempt cleanup of only their exact owned test sessions and keep
-the deployed Agents/versions. For Hub runs, they check the parent's pinned
-version, invoke `{"action":"cleanup"}` on that exact Hub session, and delete the
+The text smoke client attempts cleanup of only its exact owned test session and
+keeps the deployed Agents/versions. For Hub runs, it checks the parent's pinned
+version, invokes `{"action":"cleanup"}` on that exact Hub session, and deletes the
 parent only after the Hub confirms its child bindings are empty. Child GET/DELETE
 requests use the **Hub's Hosted identity**, not the CLI identity. Every child is
 version-checked before deletion; mismatches remain recorded for explicit review.
@@ -237,9 +242,14 @@ restore with an empty binding map. An unbound startup/capture process does not
 issue child requests; repeated cleanup never creates sessions.
 Normal cleanup does not require the operator to manage another identity's sessions.
 
-Text smoke atomically saves the planned parent ID before CREATE. The voice driver
-saves its Voice Live/Hosted IDs as setup supplies them, before WAV input. Keep
-these reports even on failure. After a process kill, use the recorded parent ID
+Text smoke atomically saves the planned parent ID before CREATE. Keep its report
+even on failure. Its initial `create_unresolved=true` is conservative: the CREATE
+may be dispatched after that checkpoint. Cleanup clears it only after observing
+the exact pinned resource; a 404 while unresolved leaves cleanup incomplete.
+Explicit CREATE rejection also clears that flag. Pass the same ownership record
+when retrying the text client's cleanup helper.
+Never clear an unresolved outcome merely because repeated GETs return 404.
+After a process kill, use the recorded parent ID
 and the same pinned deployment manifest to repeat the Hub cleanup action before
 deleting the parent. If the Hub is unavailable, the runner reports incomplete
 cleanup: a CLI 404 is not proof that its children are gone. A project administrator
@@ -249,6 +259,12 @@ SHA256 of the Hub session ID). Do not grant roles automatically or delete by pre
 See [Hosted session permissions](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/manage-hosted-sessions#view-and-manage-sessions-across-users).
 Idle reclaim is a fallback, not proof of successful cleanup. Deleting a Hub alone
 need not delete its child sessions.
+
+Hub CREATE-outcome tracking is process-local, not a durable transaction journal.
+After losing a Hub process during CREATE, deterministic IDs recover the cleanup
+targets but not proof that server-side work has finished. An operator must
+reconcile outstanding platform operations before treating absence as final;
+this sample does not provide crash-safe distributed CREATE/DELETE transactions.
 
 When finished, inspect names/versions in `deployment.json`, verify no other
 workload uses them and any standby target is zero, then remove **only those

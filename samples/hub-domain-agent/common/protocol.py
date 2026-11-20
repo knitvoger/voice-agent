@@ -7,6 +7,8 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 AI_SCOPE = "https://ai.azure.com/.default"
+# Explicit request rejection, not an indeterminate 408/5xx or transport failure.
+DEFINITIVE_CREATE_REJECTIONS = frozenset({400, 401, 403, 404, 429})
 
 
 def sse(payload: dict[str, Any]) -> bytes:

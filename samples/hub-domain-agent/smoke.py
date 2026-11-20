@@ -13,8 +13,11 @@ import httpx
 from azure.identity.aio import DefaultAzureCredential
 
 from common.config import project_endpoint
-from common.protocol import AI_SCOPE, sse_events
+from common.protocol import AI_SCOPE, DEFINITIVE_CREATE_REJECTIONS, sse_events
 from common.records import write_report
+
+SESSION_READY_TIMEOUT_SECONDS = 90
+SESSION_POLL_SECONDS = 1
 
 
 def manifest(path: Path) -> dict[str, Any]:
@@ -52,9 +55,17 @@ async def action(
 
 
 async def cleanup(
-    http: httpx.AsyncClient, deployment: dict[str, Any], role: str, sid: str, headers: dict[str, str]
+    http: httpx.AsyncClient,
+    deployment: dict[str, Any],
+    role: str,
+    sid: str,
+    headers: dict[str, str],
+    *,
+    ownership: dict[str, Any] | None = None,
 ) -> None:
     """Delete the exact parent; the Hub cleans children using its own identity."""
+    if ownership is not None and (ownership.get("session_id") != sid or ownership.get("role") != role):
+        raise ValueError("Ownership report must match the exact role and session ID")
     owned = [(role, sid)]
     errors = []
     for owner, exact_id in owned:
@@ -66,10 +77,14 @@ async def cleanup(
                     raise RuntimeError(
                         "Hub unavailable; child cleanup cannot be verified. Retain exact IDs for operator cleanup"
                     )
+                if ownership is None or ownership.get("create_unresolved", True):
+                    raise RuntimeError("Parent CREATE outcome unresolved; retain exact ID for later reconciliation")
                 continue
             resource.raise_for_status()
             if resource.json()["version_indicator"]["agent_version"] != deployment["agents"][owner]["version"]:
                 raise RuntimeError("Refusing to delete owned ID with unexpected version")
+            if ownership is not None:
+                ownership["create_unresolved"] = False
             if role == "hub":
                 status = await action(http, deployment, role, sid, headers, "cleanup")
                 if status.get("session_id") != sid or status.get("sessions") != {}:
@@ -87,15 +102,47 @@ async def cleanup(
         raise ExceptionGroup("Cleanup incomplete; keep the exact owned IDs for operator cleanup", errors)
 
 
+async def wait_ready(
+    http: httpx.AsyncClient,
+    deployment: dict[str, Any],
+    role: str,
+    sid: str,
+    headers: dict[str, str],
+    response: httpx.Response,
+) -> None:
+    """Poll only the accepted parent's exact ID; never send business input here."""
+    async with asyncio.timeout(SESSION_READY_TIMEOUT_SECONDS):
+        while True:
+            response.raise_for_status()
+            resource = response.json()
+            if resource.get("version_indicator", {}).get("agent_version") != deployment["agents"][role]["version"]:
+                raise RuntimeError("Parent pinned version mismatch")
+            if resource.get("status") in {"active", "idle"}:
+                return
+            if resource.get("status") == "failed":
+                raise RuntimeError("Parent provisioning failed")
+            await asyncio.sleep(SESSION_POLL_SECONDS)
+            response = await http.get(
+                agent_base(deployment, role) + "/sessions/" + sid, params={"api-version": "v1"}, headers=headers
+            )
+
+
 async def run(deployment: dict[str, Any], role: str, inputs: list[str], output: Path) -> None:
     if output.exists():
         raise FileExistsError("Choose a fresh result path; do not overwrite a previous test")
     sid = "sample-" + uuid.uuid4().hex
-    report: dict[str, Any] = {"role": role, "session_id": sid, "turns": [], "cleanup_complete": False}
+    report: dict[str, Any] = {
+        "role": role,
+        "session_id": sid,
+        "turns": [],
+        "cleanup_complete": False,
+        "create_unresolved": True,
+    }
     output.parent.mkdir(parents=True, exist_ok=True)
     write_report(output, report)  # Persist the planned ID before credentials or CREATE.
     async with DefaultAzureCredential() as credential, httpx.AsyncClient(timeout=90) as http:
         headers = await auth(credential)
+        failure: BaseException | None = None
         try:
             response = await http.post(
                 agent_base(deployment, role) + "/sessions",
@@ -109,7 +156,11 @@ async def run(deployment: dict[str, Any], role: str, inputs: list[str], output: 
                     },
                 },
             )
+            if response.status_code in DEFINITIVE_CREATE_REJECTIONS:
+                report["create_unresolved"] = False
             response.raise_for_status()
+            await wait_ready(http, deployment, role, sid, headers, response)
+            report["create_unresolved"] = False
             for text in inputs:
                 answer, done = "", False
                 async with http.stream(
@@ -134,12 +185,27 @@ async def run(deployment: dict[str, Any], role: str, inputs: list[str], output: 
                     raise RuntimeError("Memory snapshot restoration was not observed")
                 report["turns"].append({"answer": answer, "status": status})
                 print(answer)
+        except BaseException as error:
+            failure = error
+            report["error_type"] = type(error).__name__
+            raise
         finally:
             try:
-                await cleanup(http, deployment, role, sid, await auth(credential))
+                await cleanup(http, deployment, role, sid, await auth(credential), ownership=report)
                 report["cleanup_complete"] = True
+            except BaseException as error:
+                report["cleanup_error_type"] = type(error).__name__
+                if failure is None:
+                    failure = error
+                    raise
+                failure.add_note("Exact session cleanup incomplete: " + type(error).__name__)
             finally:
-                write_report(output, report)
+                try:
+                    write_report(output, report)
+                except Exception as error:
+                    if failure is None:
+                        raise
+                    failure.add_note("Final result checkpoint failed: " + type(error).__name__)
 
 
 def main() -> None:

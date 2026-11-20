@@ -1,21 +1,17 @@
-"""Deployment serialization, ownership guards and exact voice-event correlation; no cloud traffic."""
+"""Deployment serialization, snapshot failures and session ownership guards; no cloud traffic."""
 
-import base64
 import json
-import wave
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock
-from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 from azure.core.exceptions import ResourceNotFoundError
 
+import common.records as records
 import common.runtime as shared
 import deploy
-import export_native_query
 import smoke
-import voice_test
 from billing.agent import BillingAgent
 from common.config import Config, project_endpoint
 
@@ -80,6 +76,7 @@ def test_create_deploys_domains_before_hub_and_preserves_partial_manifest(tmp_pa
         for call in client.agents.create_version.call_args_list
     )
     assert not client.agents.update.called and not client.agents.delete.called
+    assert json.loads((tmp_path / "deployment.json").read_text()) == result
 
 
 def test_failed_create_keeps_planned_names_and_accepted_versions(tmp_path):
@@ -96,6 +93,67 @@ def test_failed_create_keeps_planned_names_and_accepted_versions(tmp_path):
     assert set(record["agents"]) == {"billing"}
 
 
+@pytest.mark.parametrize("fail_at", range(1, 8))
+def test_interrupted_deployment_checkpoint_keeps_previous_json_and_stops_creates(tmp_path, monkeypatch, fail_at):
+    client = NS(agents=MagicMock())
+    client.agents.get.side_effect = ResourceNotFoundError("not found")
+    definitions = {}
+
+    def create(**kwargs):
+        definitions[kwargs["agent_name"]] = kwargs["definition"]
+        return NS(version="1")
+
+    client.agents.create_version.side_effect = create
+    client.agents.get_version.side_effect = lambda **kwargs: NS(
+        as_dict=lambda: {"status": "active"}, definition=definitions[kwargs["agent_name"]]
+    )
+    output = tmp_path / "deployment.json"
+    count, previous = 0, None
+    real_write = type(output).write_text
+    real_dump = records.json.dump
+
+    def interrupt():
+        nonlocal count, previous
+        count += 1
+        if count == fail_at:
+            previous = output.read_bytes() if output.exists() else None
+            return True
+        return False
+
+    def write_text(path, text, *args, **kwargs):
+        if interrupt():
+            real_write(path, text[:7], *args, **kwargs)
+            raise InterruptedError("interrupted checkpoint")
+        return real_write(path, text, *args, **kwargs)
+
+    def dump(value, stream, *args, **kwargs):
+        if interrupt():
+            stream.write('{"cut":')
+            raise InterruptedError("interrupted checkpoint")
+        return real_dump(value, stream, *args, **kwargs)
+
+    monkeypatch.setattr(type(output), "write_text", write_text)
+    monkeypatch.setattr(records.json, "dump", dump)
+    with pytest.raises(InterruptedError, match="interrupted checkpoint"):
+        deploy.create(client, ENDPOINT, IMAGES, "model", "sample", output)
+    assert client.agents.create_version.call_count == fail_at // 2
+    assert client.agents.get_version.call_count == (fail_at - 1) // 2
+    if previous is None:
+        assert not output.exists()
+    else:
+        assert output.read_bytes() == previous
+        assert set(json.loads(output.read_text())["planned_names"]) == {"hub", "billing", "booking"}
+    assert list(tmp_path.iterdir()) == ([output] if previous is not None else [])
+    before_retry = client.agents.create_version.call_count
+    if previous is not None:
+        with pytest.raises(FileExistsError):
+            deploy.create(client, ENDPOINT, IMAGES, "model", "sample", output)
+        assert client.agents.create_version.call_count == before_retry
+    else:
+        result = deploy.create(client, ENDPOINT, IMAGES, "model", "sample", output)
+        assert json.loads(output.read_text()) == result and len(result["agents"]) == 3
+
+
 @pytest.mark.parametrize(
     "image,prefix,idle",
     [("image:latest", "sample", 120), (IMAGE, "../bad", 120), (IMAGE, "sample", 119), (IMAGE, "sample", 3601)],
@@ -107,6 +165,26 @@ def test_invalid_deployment_inputs_do_not_write_cloud_resources(tmp_path, image,
             client, ENDPOINT, {**IMAGES, "hub": image}, "model", prefix, tmp_path / "deployment.json", idle=idle
         )
     client.agents.create_version.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["fsync", "replace"])
+def test_atomic_checkpoint_finalization_failure_preserves_previous_record_and_can_retry(tmp_path, monkeypatch, stage):
+    output = tmp_path / "deployment.json"
+    records.write_report(output, {"planned_names": {"hub": "owned"}})
+    before = output.read_bytes()
+    original = getattr(records.os, stage)
+
+    def fail(*_):
+        raise OSError("finalization failed")
+
+    monkeypatch.setattr(records.os, stage, fail)
+    with pytest.raises(OSError, match="finalization failed"):
+        records.write_report(output, {"agents": {"hub": {"name": "owned", "version": "1"}}})
+    assert output.read_bytes() == before and list(tmp_path.iterdir()) == [output]
+    monkeypatch.setattr(records.os, stage, original)
+    expected = {"agents": {"hub": {"name": "owned", "version": "1"}}}
+    records.write_report(output, expected)
+    assert json.loads(output.read_text()) == expected and list(tmp_path.iterdir()) == [output]
 
 
 def test_existing_agent_is_not_overwritten(tmp_path):
@@ -143,81 +221,6 @@ async def test_cleanup_refuses_mismatched_version_without_deleting():
     assert calls == ["GET"]
 
 
-def test_voice_url_pins_role_and_disables_voice_live_pools_only():
-    url = voice_test.connection_url("wss://sample.invalid/voice-live/realtime", deployment(), "hub", "version")
-    query = parse_qs(urlsplit(url).query)
-    assert query["agent-name"] == ["hub-agent"] and query["agent-version"] == ["3"]
-    assert query["agent-project-name"] == ["test"]
-    assert query["features"] == ["hosted_session_warmup:false,hosted_session_shared:false,warmup_llm:false"]
-    assert "model" not in query
-
-
-@pytest.mark.parametrize(
-    "url",
-    ["ws://sample/voice-live/realtime", "wss://sample/api/projects/p", "wss://sample/voice-live/realtime?token=secret"],
-)
-def test_voice_url_rejects_unsafe_endpoint(url):
-    with pytest.raises(ValueError):
-        voice_test.connection_url(url, deployment(), "hub", "version")
-
-
-def test_late_t1_events_are_not_attributed_to_t2():
-    trace = voice_test.Trace()
-    trace.turns.append({"turn": 1, "audio_bytes": 0, "original_audio_sent": True})
-    trace.record({"type": "input_audio_buffer.committed", "item_id": "input-one"}, 1)
-    trace.record({"type": "response.created", "response": {"id": "response-one"}}, 2)
-    trace.turns.append({"turn": 2, "audio_bytes": 0, "original_audio_sent": True})
-    trace.record({"type": "conversation.item.input_audio_transcription.completed", "item_id": "input-one"}, 3)
-    trace.record(
-        {"type": "response.audio.delta", "response_id": "response-one", "delta": base64.b64encode(b"\0\0").decode()}, 4
-    )
-    trace.record({"type": "input_audio_buffer.committed", "item_id": "input-two"}, 5)
-    trace.record({"type": "response.created", "response": {"id": "response-two"}}, 6)
-    trace.record({"type": "response.done", "response": {"id": "response-one", "status": "cancelled"}}, 7)
-    assert trace.turns[0]["audio_bytes"] == 2 and trace.turns[0]["status"] == "cancelled"
-    assert trace.turns[1]["audio_bytes"] == 0 and trace.turns[1]["input_item_id"] == "input-two"
-    assert trace.turns[1]["response_id"] == "response-two"
-
-
-def test_voice_trace_rejects_unsolicited_and_failed_responses():
-    trace = voice_test.Trace()
-    with pytest.raises(RuntimeError, match="pending"):
-        trace.record({"type": "response.created", "response": {"id": "unsolicited"}}, 1)
-    trace.turns.append({"turn": 1, "audio_bytes": 0, "original_audio_sent": True})
-    trace.record({"type": "response.created", "response": {"id": "response-one"}}, 2)
-    with pytest.raises(RuntimeError, match="failed"):
-        trace.record({"type": "response.done", "response": {"id": "response-one", "status": "failed"}}, 3)
-
-
-def test_model_error_reply_is_flagged_even_when_text_is_split():
-    trace = voice_test.Trace()
-    trace.turns.append({"turn": 1, "audio_bytes": 0, "response_id": "response-one"})
-    for delta in ("Error call", "ing model: unavailable"):
-        trace.record({"type": "response.audio_transcript.delta", "response_id": "response-one", "delta": delta}, 1)
-    assert trace.turns[0]["model_error_reply"]
-    assert "Error" not in json.dumps(trace.turns)  # No transcript content in result artifacts.
-
-
-async def test_wait_surfaces_receiver_failure_without_hanging():
-    trace = voice_test.Trace()
-    trace.error = "controlled failure"
-    with pytest.raises(RuntimeError, match="controlled failure"):
-        await trace.wait(lambda: False)
-
-
-def test_audio_validation_requires_24khz_mono_pcm(tmp_path):
-    for rate in (16000, 24000):
-        path = tmp_path / f"{rate}.wav"
-        with wave.open(str(path), "wb") as writer:
-            writer.setparams((1, 2, rate, 0, "NONE", "not compressed"))
-            writer.writeframes(b"\0\0" * 100)
-        if rate == 24000:
-            assert voice_test.audio(path) == b"\0\0" * 100
-        else:
-            with pytest.raises(ValueError):
-                voice_test.audio(path)
-
-
 async def test_capture_close_failure_is_not_reported_as_success():
     runtime = BillingAgent(Config(ENDPOINT, "model"), warmup=False)
     runtime.model = NS(close=AsyncMock(side_effect=RuntimeError("close failed")))
@@ -248,56 +251,3 @@ async def test_turn_timeout_becomes_error_without_committing_history(monkeypatch
     frames = [frame async for frame in runtime.stream("Question")]
     assert json.loads(frames[-1][6:])["type"] == "error"
     assert runtime.history == []
-
-
-def native_report():
-    return {
-        "results": [
-            {
-                "success": True,
-                "cleanup_complete": True,
-                "websocket_close_code": 1000,
-                "session_id": "session-one",
-                "started_at": 1794995233,
-                "turns": [
-                    {"turn": 1, "response_id": "response-one", "input_item_id": "input-one"},
-                    {"turn": 2, "response_id": "response-two", "input_item_id": "input-two"},
-                ],
-            }
-        ]
-    }
-
-
-def test_native_query_preserves_exact_expected_ids_and_audits_missing_rows():
-    query = export_native_query.build_query(native_report())
-    assert '"session-one", "response-one", "input-one", 1' in query
-    assert '"session-one", "response-two", "input-two", 2' in query
-    assert "kind=leftouter" in query and "metric_rows=count()" in query
-    assert "input_item_id == metric_input_id" in query and "isnotnull(native_ttfa)" in query
-    assert "expected_samples=count()" in query and "missing_samples=countif(isnull(metric_rows))" in query
-    assert "client_ttfa" not in query
-
-
-@pytest.mark.parametrize(
-    "bad", ["failed", "missing_id", "duplicate", "duplicate_input", "cleanup", "close", "receiver", "empty"]
-)
-def test_native_export_does_not_silently_drop_invalid_customers_or_turns(bad):
-    report = native_report()
-    if bad == "failed":
-        report["results"][0]["success"] = False
-    if bad == "missing_id":
-        del report["results"][0]["turns"][0]["input_item_id"]
-    if bad == "duplicate":
-        report["results"][0]["turns"][1]["response_id"] = "response-one"
-    if bad == "duplicate_input":
-        report["results"][0]["turns"][1]["input_item_id"] = "input-one"
-    if bad == "cleanup":
-        report["results"][0]["cleanup_complete"] = False
-    if bad == "close":
-        report["results"][0]["websocket_close_code"] = 1006
-    if bad == "receiver":
-        report["results"][0]["receiver_error"] = "late failure"
-    if bad == "empty":
-        report["results"] = []
-    with pytest.raises(ValueError):
-        export_native_query.build_query(report)

@@ -12,4 +12,4 @@ Set `BILLING_AGENT_IMAGE` to its published runtime digest. Optional background
 model warmup is controlled by `DOMAIN_MODEL_WARMUP` and never enters history.
 
 Follow the parent [deployment guide](../README.md) and [test procedure](../TESTING.md).
-Use `smoke.py --role billing` or `voice_test.py --role billing` for direct tests.
+Use `smoke.py --role billing` for direct text tests.

@@ -209,6 +209,47 @@ async def test_domain_create_failure_retains_owned_session_and_does_not_dispatch
     assert all(not request.url.path.endswith("/invocations") for request in requests)
 
 
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 429])
+@pytest.mark.parametrize("clean_first", [False, True])
+async def test_definitive_create_rejection_allows_later_corrected_request(runtime, status, clean_first):
+    calls, resources = [], set()
+    reject = True
+
+    def handler(request):
+        calls.append(request)
+        if request.method == "POST":
+            if reject:
+                return httpx.Response(status)
+            sid = json.loads(request.content)["agent_session_id"]
+            resources.add(sid)
+            return httpx.Response(200, json={"status": "active", "version_indicator": {"agent_version": "3"}})
+        sid = request.url.path.rsplit("/", 1)[-1]
+        if request.method == "GET":
+            return (
+                httpx.Response(200, json={"version_indicator": {"agent_version": "3"}})
+                if sid in resources
+                else httpx.Response(404)
+            )
+        assert request.method == "DELETE"
+        resources.remove(sid)
+        return httpx.Response(204)
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        await runtime.ensure_domain("billing")
+    assert not runtime.unresolved_creates and not runtime.ready
+    assert len(calls) == 1  # No automatic retry of the rejected request.
+    if clean_first:
+        await runtime.cleanup()
+        assert not runtime.sessions
+    reject = False  # A later user request after permissions/configuration/throttling recover.
+    sid = await runtime.ensure_domain("billing")
+    assert resources == {sid} and runtime.ready == {"billing"}
+    await runtime.cleanup()
+    assert not resources and not runtime.sessions and not runtime.unresolved_creates
+    assert len([r for r in calls if r.method == "POST"]) == 2
+
+
 async def test_cleanup_deletes_exact_owned_sessions_only_and_retains_failed_ids(runtime):
     runtime.sessions = {"billing": "owned-billing", "booking": "owned-booking"}
     runtime.ready = {"billing", "booking"}
@@ -413,6 +454,51 @@ async def test_restored_cleanup_cancelled_request_retains_ownership_until_retry(
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("failure", ["get", "version", "delete_before_commit", "delete_after_commit"])
+async def test_reconciling_late_child_preserves_ownership_across_cleanup_failure(runtime, failure):
+    sid = runtime.domain_session_id("billing")
+    resources, requests = set(), []
+    fail = True
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "POST":
+            raise httpx.ReadTimeout("CREATE response lost", request=request)
+        if "/agents/booking-agent/" in request.url.path:
+            return httpx.Response(404)
+        if request.method == "GET":
+            if fail and failure == "get":
+                return httpx.Response(500)
+            if sid not in resources:
+                return httpx.Response(404)
+            return httpx.Response(
+                200, json={"version_indicator": {"agent_version": "99" if fail and failure == "version" else "3"}}
+            )
+        assert request.method == "DELETE"
+        if not fail or failure == "delete_after_commit":
+            resources.remove(sid)
+        return httpx.Response(500 if fail else 204)
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.ReadTimeout):
+        await runtime.ensure_domain("billing")
+    resources.add(sid)
+    with pytest.raises(ExceptionGroup):
+        await runtime.cleanup()
+    assert runtime.sessions == {"billing": sid} and not runtime.ready
+    assert runtime.unresolved_creates == ({"billing"} if failure in {"get", "version"} else set())
+    assert (sid in resources) is (failure != "delete_after_commit")
+    if failure in {"get", "version"}:
+        assert not any(r.method == "DELETE" for r in requests)
+    fail = False
+    await runtime.cleanup()
+    assert not runtime.sessions and not runtime.unresolved_creates and not resources
+    before = len([r for r in requests if r.method == "DELETE"])
+    await runtime.cleanup()
+    assert len([r for r in requests if r.method == "DELETE"]) == before
+    assert len([r for r in requests if r.method == "POST"]) == 1
 
 
 async def test_unbound_cleanup_does_not_create_child_bindings_or_issue_requests(runtime):
@@ -684,3 +770,102 @@ async def test_final_tool_mismatch_never_dispatches_customer_input(runtime):
     runtime.model.responses.create.return_value = Stream(events)
     assert (await collect(runtime))[-1]["type"] == "error"
     assert not any(request.url.path.endswith("/invocations") for request in requests)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("final_role", ["billing", "booking"])
+async def test_announced_tool_is_validated_even_when_domain_is_cached(runtime, cached, final_role):
+    requests = install_domain(runtime)
+    runtime.model.responses.create.return_value = Stream(tool("billing"))
+    if cached:
+        assert (await collect(runtime, "First question"))[-1]["type"] == "done"
+    before_history = runtime.history.copy()
+    requests.clear()
+    model = Stream([tool("billing")[0], *tool(final_role)[1:]])
+    runtime.model.responses.create.return_value = model
+    result = await collect(runtime, "Follow-up")
+    invokes = [request for request in requests if request.url.path.endswith("/invocations")]
+    if final_role == "billing":
+        assert result[-1]["type"] == "done" and len(invokes) == 1
+        assert len(runtime.history) == len(before_history) + 2
+    else:
+        assert result[-1]["type"] == "error" and not invokes
+        assert runtime.history == before_history
+    assert model.closed and not runtime.lock.locked()
+    # A rejected stream cannot poison the next valid routing decision.
+    runtime.model.responses.create.return_value = Stream(tool("billing"))
+    assert (await collect(runtime, "Valid question"))[-1]["type"] == "done"
+    assert runtime.last_route == "billing"
+
+
+@pytest.mark.parametrize("role", ["billing", "booking"])
+@pytest.mark.parametrize("outcome", ["timeout", "cancel", "deadline"])
+@pytest.mark.parametrize("reconcile", ["cleanup", "acquire"])
+async def test_unresolved_child_create_survives_404_until_late_resource_is_deleted(
+    runtime, monkeypatch, role, outcome, reconcile
+):
+    entered, release = asyncio.Event(), asyncio.Event()
+    resources, requests = set(), []
+    uncertain = True
+    timer = asyncio.timeout(None)
+    if outcome == "deadline":
+        proxy = NS(**{name: getattr(asyncio, name) for name in dir(asyncio)})
+        proxy.timeout = lambda _: timer
+        monkeypatch.setattr(agent, "asyncio", proxy)
+
+    async def handler(request):
+        requests.append(request)
+        if request.method == "POST":
+            entered.set()
+            await release.wait()
+            raise httpx.ReadTimeout("response lost", request=request)
+        sid = request.url.path.rsplit("/", 1)[-1]
+        if request.method == "GET":
+            return (
+                httpx.Response(200, json={"status": "active", "version_indicator": {"agent_version": "3"}})
+                if sid in resources
+                else httpx.Response(404)
+            )
+        assert request.method == "DELETE" and not uncertain
+        resources.remove(sid)
+        return httpx.Response(204)
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    task = asyncio.create_task(runtime.ensure_domain(role))
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        if outcome == "cancel":
+            task.cancel()
+        elif outcome == "deadline":
+            timer.reschedule(asyncio.get_running_loop().time() - 1)
+        else:
+            release.set()
+        error = {"cancel": asyncio.CancelledError, "timeout": httpx.ReadTimeout, "deadline": TimeoutError}[outcome]
+        with pytest.raises(error):
+            await task
+        if outcome == "deadline":
+            monkeypatch.setattr(agent, "asyncio", asyncio)
+        sid = runtime.domain_session_id(role)
+        for _ in range(2):
+            with pytest.raises(ExceptionGroup, match="cleanup failed"):
+                await runtime.cleanup()
+            assert runtime.sessions == {role: sid} and not runtime.ready
+        # Retrying acquisition must not submit another CREATE while its outcome is unknown.
+        with pytest.raises(httpx.HTTPStatusError):
+            await runtime.ensure_domain(role)
+        assert len([r for r in requests if r.method == "POST"]) == 1
+        resources.add(sid)  # Original service-side CREATE commits after both 404s.
+        uncertain = False
+        if reconcile == "acquire":
+            assert await runtime.ensure_domain(role) == sid
+            assert runtime.ready == {role}
+        await runtime.cleanup()
+        assert not runtime.sessions and not runtime.ready and not resources and not runtime.unresolved_creates
+        await runtime.cleanup()
+        assert len([r for r in requests if r.method == "DELETE"]) == 1
+        assert len([r for r in requests if r.method == "POST"]) == 1
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

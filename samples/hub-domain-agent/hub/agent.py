@@ -12,7 +12,7 @@ from typing import Any
 
 import anyio
 
-from common.protocol import AI_SCOPE, sse_events
+from common.protocol import AI_SCOPE, DEFINITIVE_CREATE_REJECTIONS, sse_events
 from common.runtime import Runtime
 from common.runtime import create_app as runtime_app
 from hub.config import HubConfig
@@ -28,6 +28,7 @@ class HubAgent(Runtime):
         super().__init__(config, role="hub", prompt=HUB_PROMPT)
         self.sessions: dict[str, str] = {}
         self.ready: set[str] = set()
+        self.unresolved_creates: set[str] = set()
 
     def owned_sessions(self) -> dict[str, str]:
         return self.sessions
@@ -59,25 +60,35 @@ class HubAgent(Runtime):
         # Record ownership before I/O, including indeterminate/cancelled CREATEs.
         sid = self.sessions.setdefault(role, self.domain_session_id(role))
         auth = await self.auth()
-        response = await self.http.post(
-            self.domain_base(role) + "/sessions",
-            params={"api-version": "v1"},
-            headers=auth,
-            json={
-                "agent_session_id": sid,
-                "version_indicator": {"type": "version_ref", "agent_version": self.config.domains[role].version},
-            },
-        )
-        if response.status_code == 409:
+        if role in self.unresolved_creates:
+            # Reconcile the original request; never submit a second ambiguous CREATE.
             response = await self.http.get(
                 self.domain_base(role) + "/sessions/" + sid, params={"api-version": "v1"}, headers=auth
             )
+        else:
+            self.unresolved_creates.add(role)
+            response = await self.http.post(
+                self.domain_base(role) + "/sessions",
+                params={"api-version": "v1"},
+                headers=auth,
+                json={
+                    "agent_session_id": sid,
+                    "version_indicator": {"type": "version_ref", "agent_version": self.config.domains[role].version},
+                },
+            )
+            if response.status_code in DEFINITIVE_CREATE_REJECTIONS:
+                self.unresolved_creates.discard(role)
+            if response.status_code == 409:
+                response = await self.http.get(
+                    self.domain_base(role) + "/sessions/" + sid, params={"api-version": "v1"}, headers=auth
+                )
         response.raise_for_status()
         start_type = response.headers.get("x-ms-debug-latency-session-start-type", "unknown")
         while True:
             resource = response.json()
             if resource.get("version_indicator", {}).get("agent_version") != self.config.domains[role].version:
                 raise RuntimeError("Domain pinned version mismatch")
+            self.unresolved_creates.discard(role)
             if resource.get("status") in {"active", "idle"}:
                 break
             if resource.get("status") == "failed":
@@ -109,6 +120,8 @@ class HubAgent(Runtime):
                 auth = await self.auth()
                 path = self.domain_base(role) + "/sessions/" + sid
                 response = await self.http.get(path, params={"api-version": "v1"}, headers=auth)
+                if response.status_code == 404 and role in self.unresolved_creates:
+                    raise RuntimeError("Domain CREATE outcome unresolved; retain ID for later reconciliation")
                 if response.status_code != 404:
                     response.raise_for_status()
                     if (
@@ -116,11 +129,13 @@ class HubAgent(Runtime):
                         != self.config.domains[role].version
                     ):
                         raise RuntimeError("Refusing to delete Domain ID with unexpected version")
+                    self.unresolved_creates.discard(role)
                     response = await self.http.delete(path, params={"api-version": "v1"}, headers=auth)
                 if response.status_code != 404:
                     response.raise_for_status()
                 del self.sessions[role]
                 self.ready.discard(role)
+                self.unresolved_creates.discard(role)
             except Exception as error:
                 errors.append(error)
         if errors:
@@ -198,10 +213,14 @@ class HubAgent(Runtime):
                 "parallel_tool_calls": False,
             }
             calls, completed, spoken = [], False, False
+            announced: str | None = None
             async with aclosing(self.model_events(text, **options)) as events:
                 async for event in events:
                     if event.type == "response.output_item.added" and event.item.type == "function_call":
                         role = event.item.name
+                        if announced is not None:
+                            raise RuntimeError("Expected one announced tool")
+                        announced = role
                         if role in self.config.domains and not tasks and not spoken and role not in self.ready:
                             tasks[role] = asyncio.create_task(self.ensure_domain(role), name="domain-prefetch-" + role)
                     elif event.type == "response.output_text.delta":
@@ -216,14 +235,14 @@ class HubAgent(Runtime):
             if not completed:
                 raise RuntimeError("Truncated model stream")
             self.last_route = "self"
-            if calls:
+            if announced is not None or calls:
                 if len(calls) != 1 or spoken or calls[0].name not in self.config.domains:
                     raise RuntimeError("Expected one registered tool and no spoken preamble")
                 call = calls[0]
                 if json.loads(call.arguments) != {}:
                     raise RuntimeError("Domain tool arguments must be the empty object")
-                if tasks and call.name not in tasks:
-                    raise RuntimeError("Final tool does not match speculative session acquisition")
+                if announced != call.name:
+                    raise RuntimeError("Final tool does not match the announced route")
                 self.last_route = call.name
                 logger.info("HUB_ROUTE session_id=%s turn=%s route=%s", self.session_id, self.turn, call.name)
                 async with aclosing(self.domain_reply(call.name, text, tasks)) as deltas:
