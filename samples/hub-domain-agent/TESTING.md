@@ -144,10 +144,14 @@ Require audio and distinct response/input IDs for both turns, successful scoped
 cleanup, and inspect any transport/model errors. A close-code1006 after output
 must be retained as a lifecycle issue, not described as an error-free run.
 `success=true` is assigned only after valid turn IDs, normal shutdown (1000/1001),
-and successful owned cleanup. The 300-second customer deadline excludes teardown;
-socket teardown and session cleanup each have a separate 120-second bound and
+and successful owned cleanup. Session cleanup is outside the 300-second customer
+deadline; socket teardown is still inside it (a separately tracked review finding).
+Socket teardown and session cleanup each have a separate 120-second bound and
 are shielded/drained before cancellation propagates. A cleanup timeout/failure
 stops the serial cohort, retains the failed customer, and blocks native export.
+Close failure or shutdown expiry cancels and drains the receiver before returning,
+so it cannot indefinitely prevent the parent-session cleanup attempt. See
+[cleanup regression evidence](FIX_VALIDATION.md) for the supported paths and limits.
 The platform may merge interrupted T1 ASR with T2 input; Hub forwards the input
 it actually receives unchanged. Do not assume the T2 invocation equals only
 the second WAV transcript under immediate interruption.

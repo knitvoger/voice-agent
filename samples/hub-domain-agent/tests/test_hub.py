@@ -1,6 +1,7 @@
 """Real runtime, SSE and SDK routes; only model, identity and Domain network are substituted."""
 
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock
@@ -229,6 +230,8 @@ async def test_conflicting_version_is_not_deleted_and_remains_in_ownership_repor
 
     def handler(request):
         requests.append(request)
+        if "/agents/booking-agent/" in request.url.path:
+            return httpx.Response(404)
         if request.method == "POST":
             return httpx.Response(409)
         assert request.method == "GET"
@@ -240,7 +243,7 @@ async def test_conflicting_version_is_not_deleted_and_remains_in_ownership_repor
     with pytest.raises(ExceptionGroup):
         await runtime.cleanup()
     assert "billing" in runtime.sessions and "billing" not in runtime.ready
-    assert [request.method for request in requests] == ["POST", "GET", "GET"]
+    assert [request.method for request in requests] == ["POST", "GET", "GET", "GET"]
     assert requests[1].url.path == requests[2].url.path
 
 
@@ -251,6 +254,8 @@ async def test_cleanup_checks_pinned_version_before_deleting_exact_domain(runtim
 
     def handler(request):
         requests.append(request)
+        if "/agents/booking-agent/" in request.url.path:
+            return httpx.Response(404)
         if request.method == "GET":
             return httpx.Response(200, json={"version_indicator": {"agent_version": "3"}})
         return httpx.Response(204)
@@ -258,8 +263,163 @@ async def test_cleanup_checks_pinned_version_before_deleting_exact_domain(runtim
     runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     await runtime.cleanup()
     assert not runtime.sessions and not runtime.ready
-    assert [request.method for request in requests] == ["GET", "DELETE"]
-    assert all(request.url.path.endswith("/sessions/owned-billing") for request in requests)
+    assert [request.method for request in requests] == ["GET", "DELETE", "GET"]
+    assert all(request.url.path.endswith("/sessions/owned-billing") for request in requests[:2])
+    assert "/agents/booking-agent/" in requests[-1].url.path
+
+
+@pytest.fixture
+async def restored_runtime(runtime, monkeypatch):
+    runtime.session_id = None
+    await runtime.before_snapshot()
+    credential = NS(get_token=AsyncMock(return_value=NS(token="restored-token")), close=AsyncMock())
+    model = NS(close=AsyncMock())
+    project = NS(get_openai_client=MagicMock(return_value=model), close=AsyncMock())
+    monkeypatch.setattr(shared, "DefaultAzureCredential", lambda: credential)
+    monkeypatch.setattr(shared, "AIProjectClient", lambda **_: project)
+    await runtime.after_restore(AgentSessionContext("restored-hub", "restore-cleanup"))
+    await runtime.http.aclose()
+    assert runtime.owned_sessions() == {} and runtime.ready == set()
+    return runtime
+
+
+def restored_ids(runtime):
+    suffix = hashlib.sha256(runtime.session_id.encode()).hexdigest()[:40]
+    return {role: role + "_" + suffix for role in ("billing", "booking")}
+
+
+@pytest.mark.parametrize("present", [(), ("billing",), ("booking",), ("billing", "booking")])
+async def test_restored_cleanup_checks_both_child_ids_and_is_idempotent(restored_runtime, present):
+    runtime = restored_runtime
+    ids = restored_ids(runtime)
+    resources = {ids[role] for role in present} | {"other-customer"}
+    requests = []
+    before = (runtime.session_id, runtime.restore_id, runtime.turn, runtime.history.copy())
+
+    def handler(request):
+        requests.append(request)
+        exact_id = request.url.path.rsplit("/", 1)[-1]
+        assert exact_id in ids.values() and request.headers["authorization"] == "Bearer restored-token"
+        if request.method == "GET":
+            return (
+                httpx.Response(200, json={"version_indicator": {"agent_version": "3"}})
+                if exact_id in resources
+                else httpx.Response(404)
+            )
+        assert request.method == "DELETE"
+        resources.remove(exact_id)
+        return httpx.Response(204)
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await runtime.cleanup()
+    assert {r.url.path.rsplit("/", 1)[-1] for r in requests if r.method == "GET"} == set(ids.values())
+    assert resources == {"other-customer"} and not runtime.sessions and not runtime.ready
+    first_deletes = len([r for r in requests if r.method == "DELETE"])
+    assert first_deletes == len(present)
+    await runtime.cleanup()  # Repeated terminal cleanup must not create/delete anything else.
+    assert len([r for r in requests if r.method == "DELETE"]) == first_deletes
+    assert resources == {"other-customer"} and not runtime.sessions
+    assert (runtime.session_id, runtime.restore_id, runtime.turn, runtime.history) == before
+
+
+@pytest.mark.parametrize("failure", ["version", "get", "delete"])
+async def test_restored_cleanup_failure_retains_binding_and_retry_finishes(restored_runtime, failure):
+    runtime = restored_runtime
+    ids = restored_ids(runtime)
+    resources = set(ids.values())
+    requests = []
+    fail = True
+
+    def handler(request):
+        requests.append(request)
+        sid = request.url.path.rsplit("/", 1)[-1]
+        assert sid in resources | set(ids.values())
+        if sid == ids["billing"] and fail:
+            if failure == "get" and request.method == "GET" or failure == "delete" and request.method == "DELETE":
+                return httpx.Response(500)
+            if failure == "version":
+                assert request.method == "GET"
+                return httpx.Response(200, json={"version_indicator": {"agent_version": "99"}})
+        if request.method == "GET":
+            return (
+                httpx.Response(200, json={"version_indicator": {"agent_version": "3"}})
+                if sid in resources
+                else httpx.Response(404)
+            )
+        assert request.method == "DELETE"
+        resources.remove(sid)
+        return httpx.Response(204)
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ExceptionGroup, match="cleanup failed"):
+        await runtime.cleanup()
+    assert runtime.sessions == {"billing": ids["billing"]}
+    assert resources == {ids["billing"]} and not runtime.ready
+    if failure in {"version", "get"}:
+        assert not any(r.method == "DELETE" and r.url.path.endswith(ids["billing"]) for r in requests)
+    fail = False
+    await runtime.cleanup()
+    assert not runtime.sessions and not runtime.ready and not resources
+    assert all(r.method in {"GET", "DELETE"} for r in requests)
+
+
+@pytest.mark.parametrize("role", ["billing", "booking"])
+@pytest.mark.parametrize("phase", ["get", "delete_before_commit", "delete_after_commit"])
+async def test_restored_cleanup_cancelled_request_retains_ownership_until_retry(restored_runtime, role, phase):
+    runtime = restored_runtime
+    ids = restored_ids(runtime)
+    resources = set(ids.values()) | {"unrelated"}
+    entered = asyncio.Event()
+    block = True
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        sid = request.url.path.rsplit("/", 1)[-1]
+        assert sid in ids.values()
+        mutation = "GET" if phase == "get" else "DELETE"
+        if block and sid == ids[role] and request.method == mutation:
+            if phase == "delete_after_commit":
+                resources.remove(sid)  # Remote deletion committed before the local await returns.
+            entered.set()
+            await asyncio.Event().wait()
+        if request.method == "GET":
+            return (
+                httpx.Response(200, json={"version_indicator": {"agent_version": "3"}})
+                if sid in resources
+                else httpx.Response(404)
+            )
+        assert request.method == "DELETE"
+        resources.remove(sid)
+        return httpx.Response(204)
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    task = asyncio.create_task(runtime.cleanup())
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        expected_ids = ids if role == "billing" else {"booking": ids["booking"]}
+        expected_resources = set(expected_ids.values()) | {"unrelated"}
+        if phase == "delete_after_commit":
+            expected_resources.remove(ids[role])
+        assert runtime.sessions == expected_ids and resources == expected_resources and not runtime.ready
+        block = False
+        await runtime.cleanup()
+        assert not runtime.sessions and resources == {"unrelated"}
+        assert all(request.method in {"GET", "DELETE"} for request in requests)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_unbound_cleanup_does_not_create_child_bindings_or_issue_requests(runtime):
+    runtime.session_id = None
+    await runtime.cleanup()
+    assert not runtime.sessions and not runtime.ready
+    runtime.credential.get_token.assert_not_awaited()
 
 
 @pytest.mark.parametrize("child_version", ["3", "99"])
@@ -272,6 +432,8 @@ async def test_cli_requests_hub_identity_cleanup_before_deleting_parent(runtime,
     def child_handler(request):
         child_requests.append(request)
         assert request.headers["authorization"] == "Bearer test-token"
+        if "/agents/booking-agent/" in request.url.path:
+            return httpx.Response(404)
         if request.method == "GET":
             return httpx.Response(200, json={"version_indicator": {"agent_version": child_version}})
         return httpx.Response(204)
@@ -304,13 +466,13 @@ async def test_cli_requests_hub_identity_cleanup_before_deleting_parent(runtime,
             await smoke.cleanup(client, manifest, "hub", "hub-one", {"Authorization": "Bearer operator-token"})
             assert deleted and not runtime.sessions
             assert [request.method for request in cli_requests] == ["GET", "POST", "DELETE", "GET"]
-            assert [request.method for request in child_requests] == ["GET", "DELETE"]
+            assert [request.method for request in child_requests] == ["GET", "DELETE", "GET"]
         else:
             with pytest.raises(ExceptionGroup):
                 await smoke.cleanup(client, manifest, "hub", "hub-one", {"Authorization": "Bearer operator-token"})
             assert not deleted and runtime.sessions == {"billing": "owned-billing"}
             assert [request.method for request in cli_requests] == ["GET", "POST"]
-            assert [request.method for request in child_requests] == ["GET"]
+            assert [request.method for request in child_requests] == ["GET", "GET"]
 
 
 @pytest.mark.parametrize("final_status,version", [("active", "3"), ("failed", "3"), ("active", "99")])

@@ -302,17 +302,17 @@ async def exchange(
             async with asyncio.timeout(CLEANUP_TIMEOUT_SECONDS):
                 try:
                     await socket.close()
+                    await receiver
                 finally:
-                    try:
-                        await receiver
-                    finally:
-                        if not receiver.done():
-                            receiver.cancel()
-                            await asyncio.gather(receiver, return_exceptions=True)
-                        result["websocket_close_code"] = socket.close_code
-                        if trace.error:
-                            result["receiver_error"] = trace.error
-                        checkpoint()
+                    # A timeout may already have delivered cancellation in close().
+                    # Cancel first: awaiting a live receiver here could wait forever.
+                    if not receiver.done():
+                        receiver.cancel()
+                    await asyncio.gather(receiver, return_exceptions=True)
+                    result["websocket_close_code"] = socket.close_code
+                    if trace.error:
+                        result["receiver_error"] = trace.error
+                    checkpoint()
 
         await drain_owned(asyncio.create_task(shutdown()))
         if trace.error or socket.close_code not in {1000, 1001}:

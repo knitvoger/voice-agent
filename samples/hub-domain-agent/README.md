@@ -232,6 +232,9 @@ version, invoke `{"action":"cleanup"}` on that exact Hub session, and delete the
 parent only after the Hub confirms its child bindings are empty. Child GET/DELETE
 requests use the **Hub's Hosted identity**, not the CLI identity. Every child is
 version-checked before deletion; mismatches remain recorded for explicit review.
+The Hub reconstructs both deterministic child IDs before cleanup, including after
+restore with an empty binding map. An unbound startup/capture process does not
+issue child requests; repeated cleanup never creates sessions.
 Normal cleanup does not require the operator to manage another identity's sessions.
 
 Text smoke atomically saves the planned parent ID before CREATE. The voice driver

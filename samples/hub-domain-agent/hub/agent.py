@@ -44,6 +44,10 @@ class HubAgent(Runtime):
     def domain_base(self, role: str) -> str:
         return self.config.endpoint + "/agents/" + self.config.domains[role].name + "/endpoint"
 
+    def domain_session_id(self, role: str) -> str:
+        assert self.session_id is not None
+        return role + "_" + hashlib.sha256(self.session_id.encode()).hexdigest()[:40]
+
     async def ensure_domain(self, role: str) -> str:
         async with asyncio.timeout(SESSION_READY_TIMEOUT_SECONDS):
             return await self._ensure_domain(role)
@@ -53,7 +57,7 @@ class HubAgent(Runtime):
             return self.sessions[role]
         assert self.session_id is not None
         # Record ownership before I/O, including indeterminate/cancelled CREATEs.
-        sid = self.sessions.setdefault(role, role + "_" + hashlib.sha256(self.session_id.encode()).hexdigest()[:40])
+        sid = self.sessions.setdefault(role, self.domain_session_id(role))
         auth = await self.auth()
         response = await self.http.post(
             self.domain_base(role) + "/sessions",
@@ -94,6 +98,11 @@ class HubAgent(Runtime):
         return sid
 
     async def cleanup(self) -> None:
+        # A restored process loses its bindings, not the deterministic child IDs.
+        # Seed both before I/O so failure/cancellation retains the remaining work.
+        if self.session_id is not None:
+            for role in self.config.domains:
+                self.sessions.setdefault(role, self.domain_session_id(role))
         errors = []
         for role, sid in list(self.sessions.items()):
             try:

@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -60,6 +60,60 @@ class Socket:
         if self.late_error:
             self.queue.put_nowait({"type": "error"})
         self.queue.put_nowait(None)
+
+
+class ClosingSocket(Socket):
+    def __init__(self, mode):
+        super().__init__()
+        self.mode = mode
+        self.close_entered = asyncio.Event()
+        self.receiver_stopped = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_calls = 0
+
+    async def __aiter__(self):
+        try:
+            async for message in super().__aiter__():
+                yield message
+        finally:
+            self.receiver_stopped.set()
+
+    async def close(self):
+        self.close_calls += 1
+        self.close_entered.set()
+        if self.mode == "error_after_receiver":
+            await super().close()
+            await self.receiver_stopped.wait()
+            raise RuntimeError("controlled close failure")
+        if self.mode == "error_before_receiver":
+            raise RuntimeError("controlled close failure")
+        if self.mode == "timeout_before_receiver":
+            await self.close_release.wait()
+            await super().close()
+        elif self.mode == "timeout_receiving":
+            return  # Close completed, but the receiver has not reached EOF.
+        else:
+            await super().close()
+
+
+def controlled_shutdown(monkeypatch):
+    timers, tasks = [], []
+    proxy = NS(**{name: getattr(asyncio, name) for name in dir(asyncio)})
+
+    def timeout(seconds):
+        timer = asyncio.timeout(None)
+        if seconds == voice_test.CLEANUP_TIMEOUT_SECONDS:
+            timers.append(timer)
+        return timer
+
+    def spawn(coro, **kwargs):
+        task = asyncio.create_task(coro, **kwargs)
+        tasks.append(task)
+        return task
+
+    proxy.timeout, proxy.create_task = timeout, spawn
+    monkeypatch.setattr(voice_test, "asyncio", proxy)
+    return timers, tasks
 
 
 def arguments(tmp_path):
@@ -163,6 +217,86 @@ async def test_voice_rejects_final_receiver_errors_and_abnormal_closes(tmp_path,
     assert not result["success"] and result["cleanup_complete"] and result["websocket_close_code"] == close_code
     if late_error:
         assert result["receiver_error"] == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "mode", ["error_before_receiver", "error_after_receiver", "timeout_before_receiver", "timeout_receiving"]
+)
+async def test_failed_socket_close_drains_receiver_then_cleans_parent(tmp_path, monkeypatch, mode):
+    socket = ClosingSocket(mode)
+    install_provider(monkeypatch, socket)
+    timers, owned_tasks = controlled_shutdown(monkeypatch)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(voice_test, "cleanup_customer", cleanup)
+    trace = voice_test.Trace()
+    record = MagicMock(wraps=trace.record)
+    trace.record = record
+    monkeypatch.setattr(voice_test, "Trace", lambda: trace)
+    result = {}
+    task = asyncio.create_task(
+        voice_test.customer(deployment(), arguments(tmp_path), Credential(), [b"one", b"two"], result, lambda: None)
+    )
+    try:
+        await asyncio.wait_for(socket.close_entered.wait(), 30)
+        if mode.startswith("timeout"):
+            timers[0].reschedule(asyncio.get_running_loop().time() - 1)
+        await asyncio.wait_for(socket.receiver_stopped.wait(), 30)
+        error = TimeoutError if mode.startswith("timeout") else RuntimeError
+        with pytest.raises(error):
+            await task
+        assert all(owned.done() for owned in owned_tasks)
+        assert socket.close_calls == 1 and trace.closed
+        assert result["cleanup_complete"] and not result["success"]
+        cleanup.assert_awaited_once()
+        assert cleanup.call_args.args[2] == "hosted-owned"
+        count = record.call_count
+        socket.queue.put_nowait({"type": "error"})  # Terminal receiver cannot dispatch later events.
+        assert record.call_count == count
+        # A failed customer's tasks cannot poison a subsequent valid customer.
+        monkeypatch.setattr(voice_test, "Trace", type(trace))
+        install_provider(monkeypatch, Socket())
+        subsequent = {}
+        await voice_test.customer(
+            deployment(), arguments(tmp_path), Credential(), [b"one", b"two"], subsequent, lambda: None
+        )
+        assert subsequent["success"] and subsequent["cleanup_complete"]
+        assert cleanup.await_count == 2 and all(owned.done() for owned in owned_tasks)
+    finally:
+        for owned in owned_tasks:
+            if not owned.done():
+                owned.cancel()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, *owned_tasks, return_exceptions=True)
+
+
+async def test_cancellation_during_close_drains_receiver_before_parent_cleanup(tmp_path, monkeypatch):
+    socket = ClosingSocket("timeout_before_receiver")
+    install_provider(monkeypatch, socket)
+    _, owned_tasks = controlled_shutdown(monkeypatch)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(voice_test, "cleanup_customer", cleanup)
+    result = {}
+    task = asyncio.create_task(
+        voice_test.customer(deployment(), arguments(tmp_path), Credential(), [b"one", b"two"], result, lambda: None)
+    )
+    try:
+        await asyncio.wait_for(socket.close_entered.wait(), 30)
+        task.cancel()
+        socket.close_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert socket.receiver_stopped.is_set() and all(owned.done() for owned in owned_tasks)
+        assert result["cleanup_complete"] and not result["success"]
+        cleanup.assert_awaited_once()
+        assert cleanup.call_args.args[2] == "hosted-owned"
+    finally:
+        for owned in owned_tasks:
+            if not owned.done():
+                owned.cancel()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, *owned_tasks, return_exceptions=True)
 
 
 async def test_success_is_set_only_after_owned_session_cleanup_finishes(tmp_path, monkeypatch):
