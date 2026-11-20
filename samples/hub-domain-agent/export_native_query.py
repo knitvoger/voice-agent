@@ -11,8 +11,17 @@ def build_query(report: dict[str, Any]) -> str:
     expected = []
     seen = set()
     for customer in report["results"]:
-        if not customer.get("success") or len(customer["turns"]) != 2:
+        if (
+            not customer.get("success")
+            or not customer.get("cleanup_complete")
+            or customer.get("receiver_error")
+            or customer.get("websocket_close_code") not in {1000, 1001}
+            or len(customer["turns"]) != 2
+        ):
             raise ValueError("Cohort contains incomplete/failed customers; retain and investigate, do not drop them")
+        input_ids = [turn.get("input_item_id") for turn in customer["turns"]]
+        if not all(isinstance(value, str) and value for value in input_ids) or len(set(input_ids)) != 2:
+            raise ValueError("Missing or duplicate expected input-item ID")
         for turn in customer["turns"]:
             ids = [customer["session_id"], turn.get("response_id"), turn.get("input_item_id")]
             if not all(isinstance(value, str) and value for value in ids):

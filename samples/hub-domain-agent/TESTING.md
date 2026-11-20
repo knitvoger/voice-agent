@@ -18,6 +18,9 @@ These exercise the real routing, streaming, snapshot hooks, SDK lifecycle
 routes, OpenAI 3.55 stream parser, version serialization, cancellation and scoped
 cleanup. Model/identity/Domain network boundaries are substituted. They do not
 prove Azure IAM, container pull access, platform snapshot capture, or Voice Live.
+Client-orchestration regressions also substitute the WebSocket provider and local
+credentials: they prove ownership checkpointing, early-audio rejection, exact-ID
+validation, shutdown checks and cancellation-safe cleanup, not deployed permissions.
 
 Optional local container health check (no Azure credentials or model calls):
 
@@ -55,8 +58,13 @@ python smoke.py --role hub --output results/hub-billing-smoke.json
 ```
 
 Each command creates **one new session**, sends the two distinct Billing text
-questions, and deletes its owned parent/child IDs even on failure. Each result
+questions, and attempts exact-owned cleanup even on failure. Each result
 path must be new; never overwrite/retry a failed sample to manufacture a pass.
+The planned parent ID is atomically persisted before CREATE. Hub cleanup first
+runs inside the exact Hub session under its own Hosted identity, then the client
+deletes the parent. The client never assumes a CLI 404 means a child was deleted.
+If that Hub cannot be reached, retain the report and request explicit operator
+recovery with verified cross-user session permissions as described in README.
 
 Inspect result `turns[*].status`:
 
@@ -127,10 +135,19 @@ and starts T2 immediately after T1's first nonempty audio. It keeps a concurrent
 receiver running for cancellation/control events. There is no `response.done`
 plus fixed-delay wait before T2 and no automatic greeting/setup business turn.
 Expected T1 interruption/cancelled is not itself failure; T2 must complete.
+The original frames must all be sent before a response starts; an internal WAV
+pause that triggers an early response fails the sample rather than silently
+dropping remaining speech. Only trailing silence may be cancelled to start T2.
+Voice Live and Hosted IDs are atomically checkpointed before WAV input.
 
 Require audio and distinct response/input IDs for both turns, successful scoped
 cleanup, and inspect any transport/model errors. A close-code1006 after output
 must be retained as a lifecycle issue, not described as an error-free run.
+`success=true` is assigned only after valid turn IDs, normal shutdown (1000/1001),
+and successful owned cleanup. The 300-second customer deadline excludes teardown;
+socket teardown and session cleanup each have a separate 120-second bound and
+are shielded/drained before cancellation propagates. A cleanup timeout/failure
+stops the serial cohort, retains the failed customer, and blocks native export.
 The platform may merge interrupted T1 ASR with T2 input; Hub forwards the input
 it actually receives unchanged. Do not assume the T2 invocation equals only
 the second WAV transcript under immediate interruption.

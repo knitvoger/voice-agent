@@ -171,7 +171,7 @@ class Runtime(ABC):
 
     async def stream(self, text: str) -> AsyncIterator[bytes]:
         try:
-            async with self.lock, asyncio.timeout(TURN_TIMEOUT_SECONDS):
+            async with asyncio.timeout(TURN_TIMEOUT_SECONDS), self.lock:
                 self.turn += 1
                 started = perf_counter()
                 reply = ""
@@ -212,8 +212,11 @@ class Runtime(ABC):
         if self.session_id is not None and self.session_id != sid:
             return JSONResponse({"error": "Process already bound to another session"}, status_code=409)
         self.session_id = sid
-        if body.get("action") in {"status", "cleanup"}:
-            async with self.lock:
+        action = body.get("action")
+        if "action" in body and (not isinstance(action, str) or action not in {"status", "cleanup"}):
+            return JSONResponse({"error": "Expected action status or cleanup"}, status_code=400)
+        if action in {"status", "cleanup"}:
+            async with asyncio.timeout(TURN_TIMEOUT_SECONDS), self.lock:
                 if body["action"] == "cleanup":
                     await self.cleanup()
                 return JSONResponse(

@@ -19,6 +19,8 @@ from hub.config import HubConfig
 from hub.prompts import DOMAIN_DESCRIPTIONS, HUB_PROMPT
 
 logger = logging.getLogger(__name__)
+SESSION_READY_TIMEOUT_SECONDS = 90
+SESSION_POLL_SECONDS = 1
 
 
 class HubAgent(Runtime):
@@ -43,6 +45,10 @@ class HubAgent(Runtime):
         return self.config.endpoint + "/agents/" + self.config.domains[role].name + "/endpoint"
 
     async def ensure_domain(self, role: str) -> str:
+        async with asyncio.timeout(SESSION_READY_TIMEOUT_SECONDS):
+            return await self._ensure_domain(role)
+
+    async def _ensure_domain(self, role: str) -> str:
         if role in self.ready:
             return self.sessions[role]
         assert self.session_id is not None
@@ -63,19 +69,27 @@ class HubAgent(Runtime):
                 self.domain_base(role) + "/sessions/" + sid, params={"api-version": "v1"}, headers=auth
             )
         response.raise_for_status()
-        resource = response.json()
-        if (
-            resource.get("status") not in {"active", "idle"}
-            or resource["version_indicator"]["agent_version"] != self.config.domains[role].version
-        ):
-            raise RuntimeError("Domain not ready or pinned version mismatch")
+        start_type = response.headers.get("x-ms-debug-latency-session-start-type", "unknown")
+        while True:
+            resource = response.json()
+            if resource.get("version_indicator", {}).get("agent_version") != self.config.domains[role].version:
+                raise RuntimeError("Domain pinned version mismatch")
+            if resource.get("status") in {"active", "idle"}:
+                break
+            if resource.get("status") == "failed":
+                raise RuntimeError("Domain provisioning failed")
+            await asyncio.sleep(SESSION_POLL_SECONDS)
+            response = await self.http.get(
+                self.domain_base(role) + "/sessions/" + sid, params={"api-version": "v1"}, headers=auth
+            )
+            response.raise_for_status()
         self.ready.add(role)
         logger.info(
             "DOMAIN_READY role=%s hub_session=%s domain_session=%s start_type=%s",
             role,
             self.session_id,
             sid,
-            response.headers.get("x-ms-debug-latency-session-start-type", "unknown"),
+            start_type,
         )
         return sid
 
@@ -84,9 +98,16 @@ class HubAgent(Runtime):
         for role, sid in list(self.sessions.items()):
             try:
                 auth = await self.auth()
-                response = await self.http.delete(
-                    self.domain_base(role) + "/sessions/" + sid, params={"api-version": "v1"}, headers=auth
-                )
+                path = self.domain_base(role) + "/sessions/" + sid
+                response = await self.http.get(path, params={"api-version": "v1"}, headers=auth)
+                if response.status_code != 404:
+                    response.raise_for_status()
+                    if (
+                        response.json().get("version_indicator", {}).get("agent_version")
+                        != self.config.domains[role].version
+                    ):
+                        raise RuntimeError("Refusing to delete Domain ID with unexpected version")
+                    response = await self.http.delete(path, params={"api-version": "v1"}, headers=auth)
                 if response.status_code != 404:
                     response.raise_for_status()
                 del self.sessions[role]

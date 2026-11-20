@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 import common.protocol as protocol
 import common.runtime as shared
 import hub.agent as agent
+import smoke
 from hub.config import DomainReference, HubConfig
 
 ENDPOINT = "https://sample.invalid/api/projects/test"
@@ -223,6 +224,164 @@ async def test_cleanup_deletes_exact_owned_sessions_only_and_retains_failed_ids(
     assert len(urls) == 2 and all("owned-" in url for url in urls)
 
 
+async def test_conflicting_version_is_not_deleted_and_remains_in_ownership_report(runtime):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(409)
+        assert request.method == "GET"
+        return httpx.Response(200, json={"status": "active", "version_indicator": {"agent_version": "99"}})
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="version mismatch"):
+        await runtime.ensure_domain("billing")
+    with pytest.raises(ExceptionGroup):
+        await runtime.cleanup()
+    assert "billing" in runtime.sessions and "billing" not in runtime.ready
+    assert [request.method for request in requests] == ["POST", "GET", "GET"]
+    assert requests[1].url.path == requests[2].url.path
+
+
+async def test_cleanup_checks_pinned_version_before_deleting_exact_domain(runtime):
+    runtime.sessions = {"billing": "owned-billing"}
+    runtime.ready = {"billing"}
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"version_indicator": {"agent_version": "3"}})
+        return httpx.Response(204)
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await runtime.cleanup()
+    assert not runtime.sessions and not runtime.ready
+    assert [request.method for request in requests] == ["GET", "DELETE"]
+    assert all(request.url.path.endswith("/sessions/owned-billing") for request in requests)
+
+
+@pytest.mark.parametrize("child_version", ["3", "99"])
+async def test_cli_requests_hub_identity_cleanup_before_deleting_parent(runtime, child_version):
+    runtime.sessions = {"billing": "owned-billing"}
+    runtime.ready = {"billing"}
+    child_requests, cli_requests = [], []
+    deleted = False
+
+    def child_handler(request):
+        child_requests.append(request)
+        assert request.headers["authorization"] == "Bearer test-token"
+        if request.method == "GET":
+            return httpx.Response(200, json={"version_indicator": {"agent_version": child_version}})
+        return httpx.Response(204)
+
+    async def cli_handler(request):
+        nonlocal deleted
+        cli_requests.append(request)
+        assert request.headers["authorization"] == "Bearer operator-token"
+        assert "/agents/hub-agent/endpoint/" in request.url.path  # No CLI child-session requests.
+        if request.method == "POST":
+            assert json.loads(request.content) == {"action": "cleanup"}
+            assert request.url.params["agent_session_id"] == "hub-one"
+            try:
+                await runtime.cleanup()
+            except ExceptionGroup:
+                return httpx.Response(500)
+            return httpx.Response(200, json={"session_id": "hub-one", "sessions": runtime.sessions})
+        if request.method == "DELETE":
+            deleted = True
+            return httpx.Response(204)
+        return httpx.Response(404 if deleted else 200, json={"version_indicator": {"agent_version": "3"}})
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(child_handler))
+    manifest = {
+        "project_endpoint": ENDPOINT,
+        "agents": {role: {"name": role + "-agent", "version": "3"} for role in ("hub", "billing", "booking")},
+    }
+    async with httpx.AsyncClient(transport=httpx.MockTransport(cli_handler)) as client:
+        if child_version == "3":
+            await smoke.cleanup(client, manifest, "hub", "hub-one", {"Authorization": "Bearer operator-token"})
+            assert deleted and not runtime.sessions
+            assert [request.method for request in cli_requests] == ["GET", "POST", "DELETE", "GET"]
+            assert [request.method for request in child_requests] == ["GET", "DELETE"]
+        else:
+            with pytest.raises(ExceptionGroup):
+                await smoke.cleanup(client, manifest, "hub", "hub-one", {"Authorization": "Bearer operator-token"})
+            assert not deleted and runtime.sessions == {"billing": "owned-billing"}
+            assert [request.method for request in cli_requests] == ["GET", "POST"]
+            assert [request.method for request in child_requests] == ["GET"]
+
+
+@pytest.mark.parametrize("final_status,version", [("active", "3"), ("failed", "3"), ("active", "99")])
+async def test_domain_polls_exact_id_and_guards_every_observed_version(runtime, monkeypatch, final_status, version):
+    monkeypatch.setattr(agent, "SESSION_POLL_SECONDS", 0)  # Yield only; no live provisioning or wall-clock wait.
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"status": "creating", "version_indicator": {"agent_version": "3"}})
+        return httpx.Response(200, json={"status": final_status, "version_indicator": {"agent_version": version}})
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    if final_status == "active" and version == "3":
+        sid = await runtime.ensure_domain("billing")
+        assert "billing" in runtime.ready
+    else:
+        with pytest.raises(RuntimeError):
+            await runtime.ensure_domain("billing")
+        sid = runtime.sessions["billing"]
+        assert "billing" not in runtime.ready
+    assert [request.method for request in requests] == ["POST", "GET"]
+    assert requests[1].url.path.endswith("/sessions/" + sid)
+
+
+async def test_domain_provisioning_has_its_own_bounded_timeout_and_retains_id(runtime, monkeypatch):
+    pending = asyncio.Event()
+    timer = asyncio.timeout(None)
+    monkeypatch.setattr(agent, "asyncio", NS(timeout=lambda _: timer, sleep=asyncio.sleep))
+    monkeypatch.setattr(agent, "SESSION_POLL_SECONDS", 0)
+
+    async def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json={"status": "creating", "version_indicator": {"agent_version": "3"}})
+        pending.set()
+        await asyncio.Event().wait()
+
+    runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    task = asyncio.create_task(runtime.ensure_domain("billing"))
+    await asyncio.wait_for(pending.wait(), 5)
+    timer.reschedule(asyncio.get_running_loop().time() - 1)
+    with pytest.raises(TimeoutError):
+        await task
+    assert "billing" in runtime.sessions and "billing" not in runtime.ready
+
+
+async def test_turn_deadline_includes_waiting_for_the_session_lock(runtime, monkeypatch):
+    entered = asyncio.Event()
+    timer = asyncio.timeout(None)
+
+    def timeout(_):
+        entered.set()
+        return timer
+
+    monkeypatch.setattr(shared, "asyncio", NS(timeout=timeout))
+    await runtime.lock.acquire()
+    task = asyncio.create_task(collect(runtime))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        timer.reschedule(asyncio.get_running_loop().time() - 1)
+        assert (await task)[-1]["type"] == "error"
+        assert not runtime.history and runtime.turn == 0
+        runtime.model.responses.create.assert_not_awaited()
+    finally:
+        runtime.lock.release()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_snapshot_closes_all_clients_and_restore_rebuilds_once(runtime, monkeypatch):
     runtime.session_id = None
     old_model, old_credential, old_http = runtime.model, runtime.credential, runtime.http
@@ -298,6 +457,8 @@ def test_real_sdk_snapshot_routes_and_invoke_status(monkeypatch):
         assert response.json()["captured"] and response.json()["restore_id"] == "restore-one"
         assert response.json()["history_messages"] == 0
         assert client.post("/invocations", json=[]).status_code == 400
+        for action in ([], {}, None, 1, "unknown"):
+            assert client.post("/invocations", json={"action": action, "input": "Hello"}).status_code == 400
     assert runtime.model is None
 
 

@@ -226,12 +226,26 @@ environment enrollment blocker, not permission to change RBAC/service flags or
 fall back to another region. No standby benchmark or free-warm-pool claim is
 implied here.
 
-Both clients delete only their exact owned test session IDs (including the
-Hub's deterministically named children); they keep the deployed Agents/versions.
-Keep failed cleanup evidence and inspect those IDs explicitly. If a process is
-terminated abruptly, use recorded parent IDs and the same deterministic child-ID
-formula, not a prefix/list-wide delete. Idle reclaim is a fallback, not proof of
-successful cleanup. Deleting a Hub alone need not delete its child sessions.
+Both clients attempt cleanup of only their exact owned test sessions and keep
+the deployed Agents/versions. For Hub runs, they check the parent's pinned
+version, invoke `{"action":"cleanup"}` on that exact Hub session, and delete the
+parent only after the Hub confirms its child bindings are empty. Child GET/DELETE
+requests use the **Hub's Hosted identity**, not the CLI identity. Every child is
+version-checked before deletion; mismatches remain recorded for explicit review.
+Normal cleanup does not require the operator to manage another identity's sessions.
+
+Text smoke atomically saves the planned parent ID before CREATE. The voice driver
+saves its Voice Live/Hosted IDs as setup supplies them, before WAV input. Keep
+these reports even on failure. After a process kill, use the recorded parent ID
+and the same pinned deployment manifest to repeat the Hub cleanup action before
+deleting the parent. If the Hub is unavailable, the runner reports incomplete
+cleanup: a CLI 404 is not proof that its children are gone. A project administrator
+must verify cross-user `sessions/read` and `sessions/write` access before inspecting
+the exact deterministic child IDs (`<role>_` + first 40 hex characters of the
+SHA256 of the Hub session ID). Do not grant roles automatically or delete by prefix.
+See [Hosted session permissions](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/manage-hosted-sessions#view-and-manage-sessions-across-users).
+Idle reclaim is a fallback, not proof of successful cleanup. Deleting a Hub alone
+need not delete its child sessions.
 
 When finished, inspect names/versions in `deployment.json`, verify no other
 workload uses them and any standby target is zero, then remove **only those

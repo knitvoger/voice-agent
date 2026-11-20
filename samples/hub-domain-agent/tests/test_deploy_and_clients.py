@@ -163,10 +163,10 @@ def test_voice_url_rejects_unsafe_endpoint(url):
 
 def test_late_t1_events_are_not_attributed_to_t2():
     trace = voice_test.Trace()
-    trace.turns.append({"turn": 1, "audio_bytes": 0})
+    trace.turns.append({"turn": 1, "audio_bytes": 0, "original_audio_sent": True})
     trace.record({"type": "input_audio_buffer.committed", "item_id": "input-one"}, 1)
     trace.record({"type": "response.created", "response": {"id": "response-one"}}, 2)
-    trace.turns.append({"turn": 2, "audio_bytes": 0})
+    trace.turns.append({"turn": 2, "audio_bytes": 0, "original_audio_sent": True})
     trace.record({"type": "conversation.item.input_audio_transcription.completed", "item_id": "input-one"}, 3)
     trace.record(
         {"type": "response.audio.delta", "response_id": "response-one", "delta": base64.b64encode(b"\0\0").decode()}, 4
@@ -183,7 +183,7 @@ def test_voice_trace_rejects_unsolicited_and_failed_responses():
     trace = voice_test.Trace()
     with pytest.raises(RuntimeError, match="pending"):
         trace.record({"type": "response.created", "response": {"id": "unsolicited"}}, 1)
-    trace.turns.append({"turn": 1, "audio_bytes": 0})
+    trace.turns.append({"turn": 1, "audio_bytes": 0, "original_audio_sent": True})
     trace.record({"type": "response.created", "response": {"id": "response-one"}}, 2)
     with pytest.raises(RuntimeError, match="failed"):
         trace.record({"type": "response.done", "response": {"id": "response-one", "status": "failed"}}, 3)
@@ -255,6 +255,8 @@ def native_report():
         "results": [
             {
                 "success": True,
+                "cleanup_complete": True,
+                "websocket_close_code": 1000,
                 "session_id": "session-one",
                 "started_at": 1794995233,
                 "turns": [
@@ -276,7 +278,9 @@ def test_native_query_preserves_exact_expected_ids_and_audits_missing_rows():
     assert "client_ttfa" not in query
 
 
-@pytest.mark.parametrize("bad", ["failed", "missing_id", "duplicate", "empty"])
+@pytest.mark.parametrize(
+    "bad", ["failed", "missing_id", "duplicate", "duplicate_input", "cleanup", "close", "receiver", "empty"]
+)
 def test_native_export_does_not_silently_drop_invalid_customers_or_turns(bad):
     report = native_report()
     if bad == "failed":
@@ -285,6 +289,14 @@ def test_native_export_does_not_silently_drop_invalid_customers_or_turns(bad):
         del report["results"][0]["turns"][0]["input_item_id"]
     if bad == "duplicate":
         report["results"][0]["turns"][1]["response_id"] = "response-one"
+    if bad == "duplicate_input":
+        report["results"][0]["turns"][1]["input_item_id"] = "input-one"
+    if bad == "cleanup":
+        report["results"][0]["cleanup_complete"] = False
+    if bad == "close":
+        report["results"][0]["websocket_close_code"] = 1006
+    if bad == "receiver":
+        report["results"][0]["receiver_error"] = "late failure"
     if bad == "empty":
         report["results"] = []
     with pytest.raises(ValueError):

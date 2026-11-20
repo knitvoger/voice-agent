@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -15,6 +14,7 @@ from azure.identity.aio import DefaultAzureCredential
 
 from common.config import project_endpoint
 from common.protocol import AI_SCOPE, sse_events
+from common.records import write_report
 
 
 def manifest(path: Path) -> dict[str, Any]:
@@ -54,22 +54,26 @@ async def action(
 async def cleanup(
     http: httpx.AsyncClient, deployment: dict[str, Any], role: str, sid: str, headers: dict[str, str]
 ) -> None:
-    """Check/delete only this run's exact parent and deterministic child IDs."""
+    """Delete the exact parent; the Hub cleans children using its own identity."""
     owned = [(role, sid)]
-    if role == "hub":
-        owned = [
-            (child, child + "_" + hashlib.sha256(sid.encode()).hexdigest()[:40]) for child in ("billing", "booking")
-        ] + owned
     errors = []
     for owner, exact_id in owned:
         path = agent_base(deployment, owner) + "/sessions/" + exact_id
         try:
             resource = await http.get(path, params={"api-version": "v1"}, headers=headers)
             if resource.status_code == 404:
+                if role == "hub":
+                    raise RuntimeError(
+                        "Hub unavailable; child cleanup cannot be verified. Retain exact IDs for operator cleanup"
+                    )
                 continue
             resource.raise_for_status()
             if resource.json()["version_indicator"]["agent_version"] != deployment["agents"][owner]["version"]:
                 raise RuntimeError("Refusing to delete owned ID with unexpected version")
+            if role == "hub":
+                status = await action(http, deployment, role, sid, headers, "cleanup")
+                if status.get("session_id") != sid or status.get("sessions") != {}:
+                    raise RuntimeError("Hub did not confirm its child sessions were cleaned")
             response = await http.delete(path, params={"api-version": "v1"}, headers=headers)
             if response.status_code != 404:
                 response.raise_for_status()
@@ -89,6 +93,7 @@ async def run(deployment: dict[str, Any], role: str, inputs: list[str], output: 
     sid = "sample-" + uuid.uuid4().hex
     report: dict[str, Any] = {"role": role, "session_id": sid, "turns": [], "cleanup_complete": False}
     output.parent.mkdir(parents=True, exist_ok=True)
+    write_report(output, report)  # Persist the planned ID before credentials or CREATE.
     async with DefaultAzureCredential() as credential, httpx.AsyncClient(timeout=90) as http:
         headers = await auth(credential)
         try:
@@ -134,7 +139,7 @@ async def run(deployment: dict[str, Any], role: str, inputs: list[str], output: 
                 await cleanup(http, deployment, role, sid, await auth(credential))
                 report["cleanup_complete"] = True
             finally:
-                output.write_text(json.dumps(report, indent=2) + "\n")
+                write_report(output, report)
 
 
 def main() -> None:
