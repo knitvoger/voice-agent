@@ -13,7 +13,8 @@ from typing import Any
 import httpx
 from azure.identity.aio import DefaultAzureCredential
 
-from agent import AI_SCOPE, project_endpoint, sse_events
+from common.config import project_endpoint
+from common.protocol import AI_SCOPE, sse_events
 
 
 def manifest(path: Path) -> dict[str, Any]:

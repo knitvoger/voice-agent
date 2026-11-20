@@ -9,51 +9,26 @@ import anyio
 import httpx
 import pytest
 from azure.ai.agentserver.core import AgentSessionContext
+from helpers import Stream, collect, direct, tool
 from openai import AsyncOpenAI
 from starlette.testclient import TestClient
 
-import agent
+import common.protocol as protocol
+import common.runtime as shared
+import hub.agent as agent
+from hub.config import DomainReference, HubConfig
 
 ENDPOINT = "https://sample.invalid/api/projects/test"
 
 
-class Stream:
-    def __init__(self, events):
-        self.events = events
-        self.closed = False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        self.closed = True
-
-    async def __aiter__(self):
-        for event in self.events:
-            yield event
-
-
-def direct(text="Hello!"):
-    return [NS(type="response.output_text.delta", delta=text), NS(type="response.completed")]
-
-
-def tool(role="billing", arguments="{}"):
-    item = NS(type="function_call", id="call-one", name=role, arguments=arguments)
-    return [
-        NS(type="response.output_item.added", item=item),
-        NS(type="response.output_item.done", item=item),
-        NS(type="response.completed"),
-    ]
-
-
-def config(role="hub"):
-    domains = {name: agent.Domain(name + "-agent", "3") for name in ("billing", "booking")} if role == "hub" else {}
-    return agent.Config(ENDPOINT, "text-model", role, domains)
+def config():
+    domains = {name: DomainReference(name + "-agent", "3") for name in ("billing", "booking")}
+    return HubConfig(ENDPOINT, "text-model", domains)
 
 
 @pytest.fixture
 async def runtime():
-    value = agent.Agent(config())
+    value = agent.HubAgent(config())
     value.session_id = "hub-one"
     value.credential = NS(get_token=AsyncMock(return_value=NS(token="test-token")), close=AsyncMock())
     value.project = NS(close=AsyncMock())
@@ -61,11 +36,6 @@ async def runtime():
     value.http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: pytest.fail("Unexpected external request")))
     yield value
     await value.close_clients()
-
-
-async def collect(runtime, text="Question"):
-    raw = b"".join([part async for part in runtime.stream(text)])
-    return [json.loads(frame[6:]) for frame in raw.decode().strip().split("\n\n")]
 
 
 def install_domain(runtime, *, payload=None, create_status=200, version="3"):
@@ -82,8 +52,8 @@ def install_domain(runtime, *, payload=None, create_status=200, version="3"):
         content = (
             payload
             if payload is not None
-            else agent.sse({"type": "output_audio_transcription.delta", "delta": "30 yuan"})
-            + agent.sse({"type": "done"})
+            else protocol.sse({"type": "output_audio_transcription.delta", "delta": "30 yuan"})
+            + protocol.sse({"type": "done"})
         )
         return httpx.Response(200, content=content, headers={"content-type": "text/event-stream"})
 
@@ -147,11 +117,11 @@ async def test_invalid_or_incomplete_tool_output_never_dispatches_business_input
 @pytest.mark.parametrize(
     "payload",
     [
-        agent.sse({"type": "output_audio_transcription.delta", "delta": "Partial"}),
+        protocol.sse({"type": "output_audio_transcription.delta", "delta": "Partial"}),
         b'data: {"type":"done"}',
-        agent.sse({"type": "error"}),
-        agent.sse({"type": "done"}),
-        agent.sse({"type": "done"}) + agent.sse({"type": "output_audio_transcription.delta", "delta": "late"}),
+        protocol.sse({"type": "error"}),
+        protocol.sse({"type": "done"}),
+        protocol.sse({"type": "done"}) + protocol.sse({"type": "output_audio_transcription.delta", "delta": "late"}),
     ],
 )
 async def test_bad_domain_stream_does_not_commit_history(runtime, payload):
@@ -173,8 +143,8 @@ async def test_prefetch_overlaps_model_stream_but_business_waits_for_completion(
         assert finish_model.is_set()
         return httpx.Response(
             200,
-            content=agent.sse({"type": "output_audio_transcription.delta", "delta": "Answer"})
-            + agent.sse({"type": "done"}),
+            content=protocol.sse({"type": "output_audio_transcription.delta", "delta": "Answer"})
+            + protocol.sse({"type": "done"}),
             headers={"content-type": "text/event-stream"},
         )
 
@@ -248,7 +218,7 @@ async def test_cleanup_deletes_exact_owned_sessions_only_and_retains_failed_ids(
 
     runtime.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     with pytest.raises(ExceptionGroup):
-        await runtime.cleanup_domains()
+        await runtime.cleanup()
     assert runtime.sessions == {"billing": "owned-billing"} and runtime.ready == {"billing"}
     assert len(urls) == 2 and all("owned-" in url for url in urls)
 
@@ -264,9 +234,9 @@ async def test_snapshot_closes_all_clients_and_restore_rebuilds_once(runtime, mo
     credential = NS(close=AsyncMock())
     model = NS(close=AsyncMock())
     project = NS(get_openai_client=MagicMock(return_value=model), close=AsyncMock())
-    monkeypatch.setattr(agent, "DefaultAzureCredential", lambda: credential)
+    monkeypatch.setattr(shared, "DefaultAzureCredential", lambda: credential)
     factory = MagicMock(return_value=project)
-    monkeypatch.setattr(agent, "AIProjectClient", factory)
+    monkeypatch.setattr(shared, "AIProjectClient", factory)
     context = AgentSessionContext(
         "restored-session", "restore-1", {"PROJECT_ENDPOINT": "https://new.invalid/api/projects/new"}
     )
@@ -316,8 +286,8 @@ def test_real_sdk_snapshot_routes_and_invoke_status(monkeypatch):
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", ENDPOINT)
     credential = NS(close=AsyncMock())
     project = NS(get_openai_client=MagicMock(return_value=NS(close=AsyncMock())), close=AsyncMock())
-    monkeypatch.setattr(agent, "DefaultAzureCredential", lambda: credential)
-    monkeypatch.setattr(agent, "AIProjectClient", lambda **_: project)
+    monkeypatch.setattr(shared, "DefaultAzureCredential", lambda: credential)
+    monkeypatch.setattr(shared, "AIProjectClient", lambda **_: project)
     server, runtime = agent.create_app(config(), configure_observability=None)
     with TestClient(server) as client:
         assert client.post("/_before_snapshot", json={}).status_code == 200
@@ -362,7 +332,9 @@ async def test_real_openai355_stream_parser_and_runtime_contract(runtime):
     def handler(request):
         assert json.loads(request.content)["store"] is False
         return httpx.Response(
-            200, content=b"".join(agent.sse(value) for value in events), headers={"content-type": "text/event-stream"}
+            200,
+            content=b"".join(protocol.sse(value) for value in events),
+            headers={"content-type": "text/event-stream"},
         )
 
     runtime.model = AsyncOpenAI(

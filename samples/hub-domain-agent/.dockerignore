@@ -1,4 +1,10 @@
 *
 !requirements.txt
-!agent.py
-!prompts.py
+!common/
+!common/**
+!hub/
+!hub/**
+!billing/
+!billing/**
+!booking/
+!booking/**

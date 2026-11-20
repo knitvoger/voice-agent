@@ -16,7 +16,7 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 
-from agent import project_endpoint
+from common.config import project_endpoint
 
 
 def definition(
@@ -25,13 +25,15 @@ def definition(
     environment = {
         "PROJECT_ENDPOINT": project_endpoint(endpoint),
         "MODEL_DEPLOYMENT": model,
-        "AGENT_ROLE": role,
-        "DOMAIN_MODEL_WARMUP": str(warmup).lower(),
     }
+    if role not in {"hub", "billing", "booking"}:
+        raise ValueError("Expected hub, billing, or booking")
     if role == "hub":
         for name in ("billing", "booking"):
             environment[name.upper() + "_DOMAIN_AGENT"] = domains[name]["name"]
             environment[name.upper() + "_DOMAIN_VERSION"] = domains[name]["version"]
+    else:
+        environment["DOMAIN_MODEL_WARMUP"] = str(warmup).lower()
     return models.HostedAgentDefinition(
         cpu="1",
         memory="2Gi",
@@ -59,7 +61,7 @@ def wait_active(client: AIProjectClient, name: str, version: str) -> Any:
 def create(
     client: AIProjectClient,
     endpoint: str,
-    image: str,
+    images: dict[str, str],
     model: str,
     prefix: str,
     output: Path,
@@ -69,8 +71,11 @@ def create(
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,35}[a-z0-9]", prefix):
         raise ValueError("Use a 2–37 character lowercase alphanumeric/hyphen prefix")
-    if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
-        raise ValueError("Use the immutable linux/amd64 runtime image@sha256:<64 hex digits>")
+    if set(images) != {"hub", "billing", "booking"}:
+        raise ValueError("Supply independent hub, billing, and booking images")
+    for role, image in images.items():
+        if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
+            raise ValueError(f"Use an immutable linux/amd64 runtime image@sha256:<64 hex digits> for {role}")
     if not model.strip() or not 120 <= idle <= 3600:
         raise ValueError("A model deployment and idle timeout 120–3600s are required")
     if output.exists():
@@ -86,14 +91,14 @@ def create(
     result: dict[str, Any] = {
         "project_endpoint": project_endpoint(endpoint),
         "run_id": run_id,
-        "image": image,
+        "images": images,
         "planned_names": names,
         "agents": {},
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2) + "\n")
     for role, name in names.items():
-        body = definition(endpoint, image, model, role, result["agents"], idle=idle, warmup=warmup)
+        body = definition(endpoint, images[role], model, role, result["agents"], idle=idle, warmup=warmup)
         resource = client.agents.create_version(
             agent_name=name,
             definition=body,
@@ -120,7 +125,9 @@ def create(
 def main() -> None:
     load_dotenv(Path(__file__).with_name(".env"))
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", default=os.getenv("AGENT_IMAGE"))
+    parser.add_argument("--hub-image", default=os.getenv("HUB_AGENT_IMAGE"))
+    parser.add_argument("--billing-image", default=os.getenv("BILLING_AGENT_IMAGE"))
+    parser.add_argument("--booking-image", default=os.getenv("BOOKING_AGENT_IMAGE"))
     parser.add_argument("--prefix", default=os.getenv("AGENT_PREFIX", "hub-domain-demo"))
     parser.add_argument("--output", type=Path, default=Path("deployment.json"))
     args = parser.parse_args()
@@ -138,7 +145,7 @@ def main() -> None:
             result = create(
                 client,
                 endpoint,
-                args.image or "",
+                {"hub": args.hub_image or "", "billing": args.billing_image or "", "booking": args.booking_image or ""},
                 os.environ["MODEL_DEPLOYMENT"],
                 args.prefix,
                 args.output,

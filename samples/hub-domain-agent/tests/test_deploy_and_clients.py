@@ -11,14 +11,21 @@ import httpx
 import pytest
 from azure.core.exceptions import ResourceNotFoundError
 
-import agent
+import common.runtime as shared
 import deploy
 import export_native_query
 import smoke
 import voice_test
+from billing.agent import BillingAgent
+from common.config import Config, project_endpoint
 
 ENDPOINT = "https://sample.invalid/api/projects/test"
 IMAGE = "registry.invalid/sample@sha256:" + "a" * 64
+IMAGES = {
+    "hub": IMAGE,
+    "billing": "registry.invalid/billing@sha256:" + "b" * 64,
+    "booking": "registry.invalid/booking@sha256:" + "c" * 64,
+}
 
 
 def deployment():
@@ -41,10 +48,11 @@ def test_typed_definition_serializes_snapshot_protocol_and_domain_versions():
 
 
 @pytest.mark.parametrize("role", ["billing", "booking"])
-def test_domain_definition_uses_same_snapshot_image_model_without_hub_bindings(role):
-    body = deploy.definition(ENDPOINT, IMAGE, "model", role, {}).as_dict()
-    assert body["enable_memory_snapshot"] and body["container_configuration"]["image"] == IMAGE
-    assert body["environment_variables"]["AGENT_ROLE"] == role
+def test_specialist_definition_uses_its_own_image_without_role_switch_or_hub_bindings(role):
+    body = deploy.definition(ENDPOINT, IMAGES[role], "model", role, {}).as_dict()
+    assert body["enable_memory_snapshot"] and body["container_configuration"]["image"] == IMAGES[role]
+    assert "AGENT_ROLE" not in body["environment_variables"]
+    assert "DOMAIN_SPECIALTY" not in body["environment_variables"]
     assert "BILLING_DOMAIN_AGENT" not in body["environment_variables"]
 
 
@@ -62,7 +70,7 @@ def test_create_deploys_domains_before_hub_and_preserves_partial_manifest(tmp_pa
 
     client.agents.create_version.side_effect = create
     client.agents.get_version.side_effect = version
-    result = deploy.create(client, ENDPOINT, IMAGE, "model", "sample", tmp_path / "deployment.json")
+    result = deploy.create(client, ENDPOINT, IMAGES, "model", "sample", tmp_path / "deployment.json")
     assert list(result["agents"]) == ["billing", "booking", "hub"]
     hub = definitions[result["agents"]["hub"]["name"]].as_dict()
     assert hub["environment_variables"]["BILLING_DOMAIN_AGENT"] == result["agents"]["billing"]["name"]
@@ -77,12 +85,12 @@ def test_create_deploys_domains_before_hub_and_preserves_partial_manifest(tmp_pa
 def test_failed_create_keeps_planned_names_and_accepted_versions(tmp_path):
     client = NS(agents=MagicMock())
     client.agents.get.side_effect = ResourceNotFoundError("not found")
-    body = deploy.definition(ENDPOINT, IMAGE, "model", "billing", {})
+    body = deploy.definition(ENDPOINT, IMAGES["billing"], "model", "billing", {})
     client.agents.get_version.return_value = NS(as_dict=lambda: {"status": "active"}, definition=body)
     client.agents.create_version.side_effect = [NS(version="1"), RuntimeError("controlled failure")]
     output = tmp_path / "partial.json"
     with pytest.raises(RuntimeError, match="controlled failure"):
-        deploy.create(client, ENDPOINT, IMAGE, "model", "sample", output)
+        deploy.create(client, ENDPOINT, IMAGES, "model", "sample", output)
     record = json.loads(output.read_text())
     assert set(record["planned_names"]) == {"hub", "billing", "booking"}
     assert set(record["agents"]) == {"billing"}
@@ -95,14 +103,16 @@ def test_failed_create_keeps_planned_names_and_accepted_versions(tmp_path):
 def test_invalid_deployment_inputs_do_not_write_cloud_resources(tmp_path, image, prefix, idle):
     client = NS(agents=MagicMock())
     with pytest.raises(ValueError):
-        deploy.create(client, ENDPOINT, image, "model", prefix, tmp_path / "deployment.json", idle=idle)
+        deploy.create(
+            client, ENDPOINT, {**IMAGES, "hub": image}, "model", prefix, tmp_path / "deployment.json", idle=idle
+        )
     client.agents.create_version.assert_not_called()
 
 
 def test_existing_agent_is_not_overwritten(tmp_path):
     client = NS(agents=MagicMock())
     with pytest.raises(RuntimeError, match="existing agent"):
-        deploy.create(client, ENDPOINT, IMAGE, "model", "sample", tmp_path / "deployment.json")
+        deploy.create(client, ENDPOINT, IMAGES, "model", "sample", tmp_path / "deployment.json")
     client.agents.create_version.assert_not_called()
 
 
@@ -117,7 +127,7 @@ def test_existing_agent_is_not_overwritten(tmp_path):
 )
 def test_project_endpoint_rejects_unsafe_or_wrong_shapes(endpoint):
     with pytest.raises(ValueError):
-        agent.project_endpoint(endpoint)
+        project_endpoint(endpoint)
 
 
 async def test_cleanup_refuses_mismatched_version_without_deleting():
@@ -209,7 +219,7 @@ def test_audio_validation_requires_24khz_mono_pcm(tmp_path):
 
 
 async def test_capture_close_failure_is_not_reported_as_success():
-    runtime = agent.Agent(agent.Config(ENDPOINT, "model", "billing", {}))
+    runtime = BillingAgent(Config(ENDPOINT, "model"), warmup=False)
     runtime.model = NS(close=AsyncMock(side_effect=RuntimeError("close failed")))
     with pytest.raises(RuntimeError, match="close failed"):
         await runtime.before_snapshot()
@@ -217,12 +227,12 @@ async def test_capture_close_failure_is_not_reported_as_success():
 
 
 async def test_restore_failure_closes_partial_clients_and_keeps_retry_possible(monkeypatch):
-    runtime = agent.Agent(agent.Config(ENDPOINT, "model", "billing", {}))
+    runtime = BillingAgent(Config(ENDPOINT, "model"), warmup=False)
     runtime.captured = True
     credential = NS(close=AsyncMock())
     project = NS(get_openai_client=MagicMock(side_effect=RuntimeError("controlled")), close=AsyncMock())
-    monkeypatch.setattr(agent, "DefaultAzureCredential", lambda: credential)
-    monkeypatch.setattr(agent, "AIProjectClient", lambda **_: project)
+    monkeypatch.setattr(shared, "DefaultAzureCredential", lambda: credential)
+    monkeypatch.setattr(shared, "AIProjectClient", lambda **_: project)
     with pytest.raises(RuntimeError, match="controlled"):
         await runtime.after_restore(NS(session_id="one", restore_id="restore-one", session_env_overrides={}))
     assert runtime.restore_id is None and runtime.session_id is None
@@ -231,8 +241,8 @@ async def test_restore_failure_closes_partial_clients_and_keeps_retry_possible(m
 
 
 async def test_turn_timeout_becomes_error_without_committing_history(monkeypatch):
-    runtime = agent.Agent(agent.Config(ENDPOINT, "model", "billing", {}))
-    monkeypatch.setattr(agent, "TURN_TIMEOUT_SECONDS", 0)
+    runtime = BillingAgent(Config(ENDPOINT, "model"), warmup=False)
+    monkeypatch.setattr(shared, "TURN_TIMEOUT_SECONDS", 0)
     runtime.model = NS(responses=NS(create=AsyncMock()))
     runtime.credential, runtime.project, runtime.http = object(), object(), object()
     frames = [frame async for frame in runtime.stream("Question")]

@@ -22,12 +22,12 @@ prove Azure IAM, container pull access, platform snapshot capture, or Voice Live
 Optional local container health check (no Azure credentials or model calls):
 
 ```bash
-docker build -t hub-domain-agent:local .
-docker run --rm --name hub-domain-agent-local \
+docker build -f billing/Dockerfile -t billing-agent:local .
+docker run --rm --name billing-agent-local \
   -p 127.0.0.1:8088:8088 \
   -e PROJECT_ENDPOINT=https://example.invalid/api/projects/example \
-  -e MODEL_DEPLOYMENT=example-model -e AGENT_ROLE=billing \
-  -e DOMAIN_MODEL_WARMUP=false hub-domain-agent:local
+  -e MODEL_DEPLOYMENT=example-model \
+  -e DOMAIN_MODEL_WARMUP=false billing-agent:local
 ```
 
 In another terminal, `curl --fail http://127.0.0.1:8088/readiness` must return 200.
@@ -35,10 +35,17 @@ Use Ctrl+C in the container terminal to stop it. Do not expose the local SDK
 server to an untrusted network; Azure platform authentication is not reproduced
 by this localhost check.
 
+Build Booking with `-f booking/Dockerfile` and its own tag; its entry point is
+fixed to Booking. Build Hub with `-f hub/Dockerfile` and its own tag. A local Hub
+also needs `BILLING_DOMAIN_AGENT`, `BILLING_DOMAIN_VERSION`, `BOOKING_DOMAIN_AGENT`
+and `BOOKING_DOMAIN_VERSION`; placeholder references suffice for health-only
+checks, but do not prove Domain connectivity. Do not pass `AGENT_ROLE`: it is
+not a runtime switch in any image.
+
 ## 2. Capture and deployed two-turn smoke
 
-Build/publish and run `deploy.py` as described in README. Confirm all three
-versions have `enable_memory_snapshot=true` and the intended image/model/protocol
+Build/publish all three images and run `deploy.py` as described in README. Confirm all three
+versions have `enable_memory_snapshot=true` and their respective image/model/protocol
 and idle settings. Verify the identities' required permissions before business
 testing; capture ACTIVE alone is insufficient.
 
@@ -214,4 +221,4 @@ Validation layers must stay distinct:
 | Authorized native metric audit | Exact measured TTFA for the retained requests, not a universal latency guarantee. |
 
 This change provides the procedures and local tests; it does not assert a new
-cloud deployment or benchmark has been run for this source-built image.
+cloud deployment or benchmark has been run for these source-built images.

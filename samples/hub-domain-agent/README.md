@@ -17,11 +17,26 @@ Voice Live (speech recognition/synthesis)
        └─ Hosted Booking Domain (memory snapshot enabled)
 ```
 
-All three roles use one source-built image and HTTP Invocations `2.0.0`. Each
+Hub, Billing, and Booking have **separate implementations, prompts, entry
+points, and Docker images**. All use HTTP Invocations `2.0.0`. Each
 customer gets an exclusive Hub session. Domain sessions are created lazily,
 version-pinned, and reused for that customer's later turns. Billing and Booking
 are read-only simulations: no customer data, transactions, or external business
 system. All instructions and generated test speech are English.
+
+## Separate implementations
+
+| Directory | Responsibility | Entry point |
+| --- | --- | --- |
+| [`hub/`](hub/README.md) | Self-answer, tool selection, Domain prefetch/forwarding and owned-session cleanup. | `python -m hub.main` |
+| [`billing/`](billing/README.md) | Read-only billing explanations and its own prompt. No Hub/Booking imports. | `python -m billing.main` |
+| [`booking/`](booking/README.md) | Read-only reservation explanations and its own prompt. No Hub/Billing imports. | `python -m booking.main` |
+| `common/` | Snapshot hooks, fresh clients, HTTP/SSE plumbing and bounded history. No business prompts or role switch. | Shared library only |
+
+Each business directory has its own `agent.py`, `prompts.py`, `main.py` and
+`Dockerfile`; Hub also owns `config.py` for pinned Domain references. There is
+no combined top-level `agent.py`, prompt registry, or `AGENT_ROLE` dispatcher.
+Each image copies only `common/` and its own business package.
 
 ## Behavior worth inspecting
 
@@ -92,23 +107,30 @@ az login
 PowerShell: use `py -3.13 -m venv .venv`, `.venv\Scripts\Activate.ps1`, and
 `Copy-Item .env.example .env`. Keep this environment separate from other samples.
 
-Set `.env` to your project, model deployment, immutable image reference, and
+Set `.env` to your project, model deployment, three immutable image references, and
 Voice Live endpoint. Never put tokens, keys, or tenant-specific credentials in
 source. The container receives only explicit application configuration, not
 your local `.env`, CLI profile, or result files.
 
-## Build and publish the image
+## Build and publish three images
 
 Use your existing registry and a new tag:
 
 ```bash
 az acr login --name <existing-registry>
-docker build --platform linux/amd64 -t <registry>.azurecr.io/hub-domain-agent:<new-tag> .
-docker push <registry>.azurecr.io/hub-domain-agent:<new-tag>
-docker buildx imagetools inspect <registry>.azurecr.io/hub-domain-agent:<new-tag>
+docker build --platform linux/amd64 -f hub/Dockerfile -t <registry>.azurecr.io/hub-agent:<new-tag> .
+docker build --platform linux/amd64 -f billing/Dockerfile -t <registry>.azurecr.io/billing-agent:<new-tag> .
+docker build --platform linux/amd64 -f booking/Dockerfile -t <registry>.azurecr.io/booking-agent:<new-tag> .
+docker push <registry>.azurecr.io/hub-agent:<new-tag>
+docker push <registry>.azurecr.io/billing-agent:<new-tag>
+docker push <registry>.azurecr.io/booking-agent:<new-tag>
+docker buildx imagetools inspect <registry>.azurecr.io/hub-agent:<new-tag>
+docker buildx imagetools inspect <registry>.azurecr.io/billing-agent:<new-tag>
+docker buildx imagetools inspect <registry>.azurecr.io/booking-agent:<new-tag>
 ```
 
-Set `AGENT_IMAGE` in `.env` to the immutable `image@sha256:...` reference. If the
+Set `HUB_AGENT_IMAGE`, `BILLING_AGENT_IMAGE`, and `BOOKING_AGENT_IMAGE` in `.env`
+to the corresponding immutable `image@sha256:...` references. If a
 tag points to an OCI index, select its **linux/amd64 runtime manifest**, not the
 attestation manifest. The local build does not publish or deploy automatically.
 
@@ -119,11 +141,17 @@ python deploy.py --output deployment.json
 ```
 
 This creates uniquely named Billing, Booking, then Hub agents, waits for each
-version's snapshot capture to become ACTIVE, reads back the definition, and
+version's snapshot capture to become ACTIVE, reads back its own image/definition, and
 pins the returned Domain versions in the Hub environment. Old Agents/versions
 are never updated or deleted. If creation fails partway, keep the deployment
 record: it contains planned names and accepted versions. There are no automatic
 business/deployment retries or silent snapshot-disable fallback.
+
+The three images can also be supplied explicitly with `--hub-image`,
+`--billing-image`, and `--booking-image`. `deployment.json` records them under
+`images.hub`, `images.billing`, and `images.booking`. The selected image's entry
+point determines the implementation; no environment setting switches the
+container between Hub, Billing, and Booking.
 
 The essential configuration in [`deploy.py`](deploy.py) is:
 
@@ -170,7 +198,10 @@ Files:
 
 | File | Purpose |
 | --- | --- |
-| `agent.py`, `prompts.py` | Shared snapshot-safe Hub/Billing/Booking runtime and simulated facts. |
+| `hub/agent.py`, `hub/prompts.py` | Hub-only routing, prefetch/forwarding and self-answer instructions. |
+| `billing/agent.py`, `billing/prompts.py` | Independent Billing specialist and simulated billing facts. |
+| `booking/agent.py`, `booking/prompts.py` | Independent Booking specialist and simulated reservation facts. |
+| `common/` | Shared infrastructure/lifecycle only; no specialist behavior or prompt registry. |
 | `deploy.py` | Typed snapshot-enabled definitions, unique versions, and readback manifest. |
 | `smoke.py` | Two text turns against a pinned role, lifecycle status, exact-ID cleanup. |
 | `generate_audio.py` | Optional real Azure TTS generation of Hello/Billing/Booking WAVs. |
